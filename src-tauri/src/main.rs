@@ -144,6 +144,21 @@ fn initialize_startup_state_if_needed(command: &Option<Commands>) -> Result<(), 
     ) {
         guard_legacy_first_start(command, &cc_switch_lib::get_app_config_dir())?;
     }
+    use cc_switch_lib::cli::commands::skills::SkillsCommand;
+    if matches!(
+        command,
+        Some(Commands::Skills(
+            SkillsCommand::Discover { .. }
+                | SkillsCommand::Market { .. }
+                | SkillsCommand::Install { .. }
+                | SkillsCommand::CheckUpdates
+                | SkillsCommand::Update { .. }
+        ))
+    ) {
+        // Retain the saved outbound proxy without startup migrations/recovery
+        // or clearing an invalid setting in an otherwise read-only command.
+        cc_switch_lib::services::global_proxy::initialize_http_client_from_disk_best_effort();
+    }
     if command_requires_startup_state(command) {
         let _state = if command_uses_deferred_codex_migration(command) {
             // Mirrors upstream's non-blocking GUI startup for the long-lived TUI.
@@ -244,6 +259,41 @@ mod tests {
         let conn = rusqlite::Connection::open(&db_path).expect("open sqlite db");
         conn.execute("PRAGMA user_version = 999;", [])
             .expect("set future schema version");
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_first_start_skills_retains_saved_proxy_without_database_writes() {
+        let temp = tempfile::tempdir().expect("create fixture");
+        let _config = ConfigDirEnvGuard::set(temp.path());
+        let path = temp.path().join("cc-switch.db");
+        let saved = "http://127.0.0.1:19876";
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT); PRAGMA user_version=20;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO settings VALUES ('global_proxy_url', ?1)",
+                [saved],
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let previous = cc_switch_lib::proxy::http_client::get_current_proxy_url();
+        let cli = Cli::try_parse_from(["cc-switch", "skills", "check-updates"]).unwrap();
+        initialize_startup_state_if_needed(&cli.command).unwrap();
+        let active = cc_switch_lib::proxy::http_client::get_current_proxy_url();
+        cc_switch_lib::proxy::http_client::init(previous.as_deref()).unwrap();
+        assert_eq!(active.as_deref(), Some(saved));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]

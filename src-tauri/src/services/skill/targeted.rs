@@ -32,25 +32,54 @@ fn failure(message: impl Into<String>) -> AppError {
     AppError::Message(message.into())
 }
 
+// As with local publication, rollback leftovers may contain directories only.
+// Inspect metadata without following links, including Windows reparse points.
+fn require_pinned_empty_tree(path: &Path) -> Result<(), AppError> {
+    for ancestor in path.ancestors() {
+        let meta = match fs::symlink_metadata(ancestor) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(AppError::io(ancestor, error)),
+        };
+        #[cfg(windows)]
+        let reparse = {
+            use std::os::windows::fs::MetadataExt;
+            meta.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let reparse = false;
+        if !meta.is_dir() || meta.file_type().is_symlink() || reparse {
+            return Err(AppError::InvalidInput(format!(
+                "Pinned install cannot adopt an unregistered SSOT containing files, links or special nodes: {}",
+                ancestor.display()
+            )));
+        }
+    }
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(AppError::io(path, error)),
+    };
+    for entry in entries {
+        require_pinned_empty_tree(&entry.map_err(|e| AppError::io(path, e))?.path())?;
+    }
+    Ok(())
+}
+
 impl SkillService {
     // Caller holds the skill write guard, including the post-download recheck.
     pub(super) fn reject_pinned_existing_install(name: &str) -> Result<(), AppError> {
+        Self::require_valid_directory(name)?;
         let db = Database::open_for_skill_publication()?;
-        let dest = Self::get_ssot_dir()?.join(name);
-        let destination_exists = match fs::symlink_metadata(&dest) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(AppError::io(&dest, error)),
-        };
         if db
             .get_all_installed_skills()?
             .values()
             .any(|s| s.directory.eq_ignore_ascii_case(name))
-            || destination_exists
         {
             return Err(AppError::InvalidInput("Pinned install requires a new skill; use skills update NAME --source-commit SHA for an existing skill".into()));
         }
-        Ok(())
+        let dest = in_place::managed_path(&Self::get_ssot_dir()?.join(name))?;
+        require_pinned_empty_tree(&dest)
     }
 
     pub(super) fn validate_source_commit(commit: &str) -> Result<(), AppError> {
@@ -88,7 +117,14 @@ impl SkillService {
     }
 
     fn targeted_url(host: &str, segments: &[&str]) -> Result<url::Url, AppError> {
-        let mut url = url::Url::parse(host).map_err(|e| failure(e.to_string()))?;
+        // Test-only transport seam, shared by metadata and raw blob requests.
+        #[cfg(test)]
+        let host = match segments {
+            ["repos", "ccswitch-pinned-fixture", port, ..]
+            | ["ccswitch-pinned-fixture", port, ..] => format!("http://127.0.0.1:{port}/"),
+            _ => host.to_string(),
+        };
+        let mut url = url::Url::parse(&host).map_err(|e| failure(e.to_string()))?;
         url.path_segments_mut()
             .map_err(|_| failure("Invalid GitHub URL"))?
             .extend(segments.iter().copied());
@@ -321,6 +357,49 @@ impl SkillService {
 #[cfg(test)]
 mod targeted_download_tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn pinned_empty_tree_rejects_links_and_special_nodes() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let temp = tempfile::tempdir().unwrap();
+        let empty = temp.path().join("empty");
+        let linked = temp.path().join("linked");
+        let special = temp.path().join("special");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::create_dir_all(&special).unwrap();
+        symlink(&empty, linked.join("link")).unwrap();
+        assert!(require_pinned_empty_tree(&linked).is_err());
+        assert!(require_pinned_empty_tree(&linked.join("link/absent")).is_err());
+        let _socket = UnixListener::bind(special.join("socket")).unwrap();
+        assert!(require_pinned_empty_tree(&special).is_err());
+        assert!(empty.is_dir());
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pinned_empty_tree_rejects_junctions_including_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty = temp.path().join("empty");
+        let target = temp.path().join("target");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let linked = target.join("link");
+        let output = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&linked)
+            .arg(&empty)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "junction fixture failed");
+        assert!(require_pinned_empty_tree(&target).is_err());
+        assert!(require_pinned_empty_tree(&linked.join("absent")).is_err());
+        assert!(empty.is_dir());
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+    }
+
     fn entry(path: &str, kind: &str, mode: &str, size: Option<u64>) -> GitEntry {
         GitEntry {
             path: path.into(),
@@ -514,6 +593,186 @@ mod targeted_download_tests {
 mod targeted_http_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    fn publication_server(
+        versions: Vec<(String, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let repo = format!("ccswitch-pinned-fixture/{port}");
+        let spec = format!("{repo}:second/shared");
+        let handle = std::thread::spawn(move || {
+            let root = "1".repeat(40);
+            let parent = "2".repeat(40);
+            let leaf = "3".repeat(40);
+            for (commit, content) in versions {
+                let mut hash = Sha1::new();
+                hash.update(format!("blob {}\0", content.len()).as_bytes());
+                hash.update(&content);
+                let blob = format!("{:x}", hash.finalize());
+                let git = format!("/repos/{repo}/git");
+                let responses = [
+                    (
+                        format!("{git}/commits/{commit}"),
+                        serde_json::json!({
+                            "sha": commit, "tree": {"sha": root}
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ),
+                    (
+                        format!("{git}/trees/{root}"),
+                        serde_json::json!({
+                            "sha": root, "tree": [{"path": "second", "mode": "040000",
+                                "type": "tree", "sha": parent}]
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ),
+                    (
+                        format!("{git}/trees/{parent}"),
+                        serde_json::json!({
+                            "sha": parent, "tree": [{"path": "shared", "mode": "040000",
+                                "type": "tree", "sha": leaf}]
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ),
+                    (
+                        format!("{git}/trees/{leaf}?recursive=1"),
+                        serde_json::json!({
+                            "sha": leaf, "tree": [{"path": "SKILL.md", "mode": "100644",
+                                "type": "blob", "sha": blob, "size": content.len()}]
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ),
+                    (format!("/{repo}/{commit}/second/shared/SKILL.md"), content),
+                ];
+                for (path, body) in responses {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "request missing: {path}"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(e) => panic!("accept publication request: {e}"),
+                        }
+                    };
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 2048];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let count = socket.read(&mut buffer).unwrap();
+                        assert!(count > 0 && request.len() < 16384);
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    assert_eq!(
+                        String::from_utf8_lossy(&request).lines().next().unwrap(),
+                        format!("GET {path} HTTP/1.1")
+                    );
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    socket.write_all(&body).unwrap();
+                }
+            }
+        });
+        (spec, handle)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(home_settings)]
+    async fn pinned_public_install_and_update_persist_commit_urls_and_keep_tracking_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let _pi = crate::pi_config::test_support::TestAgentDir::new();
+        let mut settings = crate::settings::AppSettings::default();
+        settings.skill_storage_location = SkillStorageLocation::Unified;
+        settings.skill_sync_method = SyncMethod::Copy;
+        crate::settings::update_settings(settings).unwrap();
+        let dest = SkillService::get_ssot_dir().unwrap().join("shared");
+        fs::create_dir_all(dest.join("leftover/empty")).unwrap();
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        let (spec, server) = publication_server(vec![
+            (first.clone(), b"# first pinned version\n".to_vec()),
+            (second.clone(), b"# second pinned version\n".to_vec()),
+        ]);
+        let service = SkillService::new().unwrap();
+        let installed = service
+            .install_at_commit(&spec, &AppType::Claude, Some(&first))
+            .await
+            .unwrap();
+        let repo = spec.split_once(':').unwrap().0;
+        let first_url = format!("https://github.com/{repo}/blob/{first}/second/shared/SKILL.md");
+        assert_eq!(installed.readme_url.as_deref(), Some(first_url.as_str()));
+        assert_eq!(installed.repo_branch.as_deref(), Some("main"));
+        assert_eq!(
+            fs::read(dest.join("SKILL.md")).unwrap(),
+            b"# first pinned version\n"
+        );
+        assert!(dest.join("leftover/empty").is_dir());
+        let db = Database::open_for_skill_publication().unwrap();
+        let mut stored = db.get_installed_skill(&installed.id).unwrap().unwrap();
+        assert_eq!(stored.readme_url, installed.readme_url);
+        assert_eq!(stored.repo_branch.as_deref(), Some("main"));
+        // An explicit branch containing '/' must remain a branch for later
+        // unpinned updates and GitHub's branch validation.
+        stored.repo_branch = Some("release/skills".into());
+        db.save_skill(&stored).unwrap();
+
+        let mut outcome = service
+            .update_skills_at_commit(&[installed.id.clone()], Some(&second))
+            .await;
+        server.join().unwrap();
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert_eq!(outcome.updated.len(), 1);
+        let updated = outcome.updated.pop().unwrap();
+        let second_url = format!("https://github.com/{repo}/blob/{second}/second/shared/SKILL.md");
+        assert_eq!(updated.readme_url.as_deref(), Some(second_url.as_str()));
+        assert_eq!(updated.repo_branch.as_deref(), Some("release/skills"));
+        let stored = db.get_installed_skill(&installed.id).unwrap().unwrap();
+        assert_eq!(stored.readme_url, updated.readme_url);
+        assert_eq!(stored.repo_branch.as_deref(), Some("release/skills"));
+        assert_eq!(
+            fs::read(dest.join("SKILL.md")).unwrap(),
+            b"# second pinned version\n"
+        );
+        assert_eq!(
+            stored.content_hash.as_deref(),
+            Some(SkillService::compute_dir_hash(&dest).unwrap().as_str())
+        );
+        assert_eq!(
+            SkillService::source_path_from_readme(&stored, None),
+            Some(PathBuf::from("second/shared"))
+        );
+
+        // A later branch download still uses the exact path from the SHA URL,
+        // even when another skill has the same directory name.
+        let branch_download = home.path().join("branch-download");
+        for path in ["first/shared", "second/shared"] {
+            fs::create_dir_all(branch_download.join(path)).unwrap();
+            fs::write(branch_download.join(path).join("SKILL.md"), path).unwrap();
+        }
+        assert_eq!(
+            SkillService::resolve_update_source(&branch_download, &stored, Some("release/skills"))
+                .unwrap(),
+            branch_download.join("second/shared")
+        );
+    }
+
     fn server(body: &'static [u8]) -> (url::Url, std::thread::JoinHandle<()>) {
         server_with_length(body, body.len())
     }
