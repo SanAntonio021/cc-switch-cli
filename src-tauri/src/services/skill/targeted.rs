@@ -706,9 +706,11 @@ mod targeted_http_tests {
         fs::create_dir_all(dest.join("leftover/empty")).unwrap();
         let first = "a".repeat(40);
         let second = "b".repeat(40);
+        let third = "c".repeat(40);
         let (spec, server) = publication_server(vec![
             (first.clone(), b"# first pinned version\n".to_vec()),
             (second.clone(), b"# second pinned version\n".to_vec()),
+            (third.clone(), b"# second pinned version\n".to_vec()),
         ]);
         let service = SkillService::new().unwrap();
         let installed = service
@@ -736,7 +738,6 @@ mod targeted_http_tests {
         let mut outcome = service
             .update_skills_at_commit(&[installed.id.clone()], Some(&second))
             .await;
-        server.join().unwrap();
         assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
         assert_eq!(outcome.updated.len(), 1);
         let updated = outcome.updated.pop().unwrap();
@@ -757,6 +758,35 @@ mod targeted_http_tests {
         assert_eq!(
             SkillService::source_path_from_readme(&stored, None),
             Some(PathBuf::from("second/shared"))
+        );
+
+        // A source-only release must advance provenance even when bytes match.
+        let modified = fs::metadata(dest.join("SKILL.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let same_content = service
+            .update_skills_at_commit(&[installed.id.clone()], Some(&third))
+            .await;
+        server.join().unwrap();
+        assert!(
+            same_content.failures.is_empty(),
+            "{:?}",
+            same_content.failures
+        );
+        let stored = db.get_installed_skill(&installed.id).unwrap().unwrap();
+        assert_eq!(
+            stored.readme_url,
+            Some(format!(
+                "https://github.com/{repo}/blob/{third}/second/shared/SKILL.md"
+            ))
+        );
+        assert_eq!(
+            fs::metadata(dest.join("SKILL.md"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
         );
 
         // A later branch download still uses the exact path from the SHA URL,

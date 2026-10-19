@@ -1353,7 +1353,12 @@ impl SkillService {
         if !Self::is_symlink(dest) {
             let mut update = in_place::Update::prepare(source, dest)?;
             update.apply()?;
-            update.commit()?;
+            // The live tree is already verified. Cleanup cannot undo deployment;
+            // reporting it as a sync failure makes first-install callers roll
+            // back DB/SSOT while leaving this deployed copy behind.
+            if let Err(error) = update.commit() {
+                log::warn!("Skill deployed; staging cleanup failed: {error}");
+            }
             return Ok(());
         }
 
@@ -3075,6 +3080,18 @@ impl SkillService {
         }
         let sync_method = Self::get_sync_method()?;
         let dest = in_place::managed_path(&Self::get_ssot_dir()?.join(&installed.directory))?;
+        // No row exists yet, so even an identical app copy is not ours to adopt.
+        // Only file-empty rollback leftovers may be reused. Check before writing
+        // SSOT or registering the row; managed updates retain their usual paths.
+        if Self::app_supports_skills(app) {
+            let app_dir = Self::get_distinct_app_skills_dir(&Self::get_ssot_dir()?, app)?;
+            let app_dest = in_place::managed_path(&app_dir.join(&installed.directory))?;
+            in_place::require_file_empty_tree(&app_dest).map_err(|error| {
+                AppError::InvalidInput(format!(
+                    "Pinned install refuses an unmanaged Skill deployment: {error}"
+                ))
+            })?;
+        }
         let mut update = in_place::Update::prepare(source, &dest)?;
 
         // The transaction removes new files but deliberately preserves directories.
@@ -4073,6 +4090,180 @@ mod tests {
 
     #[test]
     #[serial(home_settings)]
+    fn pinned_first_install_preserves_unmanaged_app_skills_before_ssot_write() {
+        for app in [AppType::Codex, AppType::Claude] {
+            for method in [SyncMethod::Copy, SyncMethod::Auto, SyncMethod::Symlink] {
+                let home = tempfile::tempdir().unwrap();
+                let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+                let _pi = crate::pi_config::test_support::TestAgentDir::new();
+                SkillService::set_sync_method(method).unwrap();
+                let _state_guard = skill_state_write_guard();
+                let (source, mut installed) = pinned_source_fixture(home.path());
+                installed.apps = SkillApps::only(&app);
+                let ssot = SkillService::get_ssot_dir().unwrap();
+                let app_dest = SkillService::get_app_skills_dir(&app)
+                    .unwrap()
+                    .join(&installed.directory);
+                fs::create_dir_all(app_dest.join("user/empty")).unwrap();
+                // Even content identical to the download cannot prove ownership.
+                fs::write(app_dest.join("SKILL.md"), b"# pinned\n").unwrap();
+                fs::write(app_dest.join("user/original"), b"user original").unwrap();
+                fs::write(app_dest.join("user/zero"), b"").unwrap();
+                let before_hash = SkillService::compute_dir_hash(&app_dest).unwrap();
+                let before_mtime = fs::metadata(app_dest.join("SKILL.md"))
+                    .unwrap()
+                    .modified()
+                    .unwrap();
+                let db = Database::init().unwrap();
+                assert!(!ssot.join(&installed.directory).exists());
+
+                let error = SkillService::install_pinned_source(&source, installed.clone(), &app)
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("unmanaged Skill deployment"),
+                    "{error}"
+                );
+                assert!(!ssot.join(&installed.directory).exists());
+                assert!(db.get_installed_skill(&installed.id).unwrap().is_none());
+                assert_eq!(
+                    SkillService::compute_dir_hash(&app_dest).unwrap(),
+                    before_hash
+                );
+                assert_eq!(
+                    fs::metadata(app_dest.join("SKILL.md"))
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    before_mtime
+                );
+                assert_eq!(
+                    fs::read(app_dest.join("user/original")).unwrap(),
+                    b"user original"
+                );
+                assert!(app_dest.join("user/zero").is_file());
+                assert!(app_dest.join("user/empty").is_dir());
+                assert_no_pinned_staging(&ssot);
+            }
+        }
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_install_app_cleanup_failure_keeps_db_ssot_and_deployment_committed() {
+        for app in [AppType::Claude, AppType::Codex] {
+            let home = tempfile::tempdir().unwrap();
+            let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+            let _pi = crate::pi_config::test_support::TestAgentDir::new();
+            SkillService::set_sync_method(SyncMethod::Copy).unwrap();
+            let _state_guard = skill_state_write_guard();
+            let (source, mut installed) = pinned_source_fixture(home.path());
+            installed.apps = SkillApps::only(&app);
+            let ssot = SkillService::get_ssot_dir().unwrap();
+            let app_dir = SkillService::get_app_skills_dir(&app).unwrap();
+            fs::create_dir_all(&app_dir).unwrap();
+            let app_dest = app_dir.join(&installed.directory);
+            let result = in_place::with_cleanup_failure(&app_dest, || {
+                SkillService::install_pinned_source(&source, installed, &app)
+            })
+            .unwrap();
+
+            let registered = Database::open_for_skill_publication()
+                .unwrap()
+                .get_installed_skill(&result.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(registered.content_hash, result.content_hash);
+            assert!(registered.apps.is_enabled_for(&app));
+            for root in [ssot.join(&result.directory), app_dest] {
+                assert_eq!(fs::read(root.join("SKILL.md")).unwrap(), b"# pinned\n");
+                assert_eq!(
+                    fs::read(root.join("references/detail.md")).unwrap(),
+                    b"new detail\n"
+                );
+                assert_eq!(
+                    SkillService::compute_dir_hash(&root).unwrap(),
+                    result.content_hash.clone().unwrap()
+                );
+            }
+            assert_no_pinned_staging(&ssot);
+            let stages: Vec<_> = fs::read_dir(&app_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".skill-in-place-")
+                })
+                .collect();
+            assert_eq!(stages.len(), 1);
+            assert!(stages[0].join("journal.json").is_file());
+            assert!(stages[0].join("next/SKILL.md").is_file());
+            let progress = fs::read_to_string(stages[0].join("progress.jsonl")).unwrap();
+            assert!(progress.lines().last().unwrap().contains("applied"));
+        }
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn managed_copy_updates_allow_structural_upgrades_and_cleanup_failure() {
+        for app in [AppType::Claude, AppType::Codex] {
+            for method in [SyncMethod::Copy, SyncMethod::Auto] {
+                let home = tempfile::tempdir().unwrap();
+                let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+                let _pi = crate::pi_config::test_support::TestAgentDir::new();
+                let _state_guard = skill_state_write_guard();
+                let ssot = SkillService::get_ssot_dir().unwrap();
+                let source = ssot.join("shared");
+                fs::create_dir_all(source.join("to_file/empty")).unwrap();
+                fs::write(source.join("SKILL.md"), b"# managed\n").unwrap();
+                fs::write(source.join("to_file/old"), b"old").unwrap();
+                fs::write(source.join("to_dir"), b"old").unwrap();
+                let mut installed = repository_skill(None);
+                installed.apps = SkillApps::only(&app);
+                Database::init().unwrap().save_skill(&installed).unwrap();
+                // Force the initial physical copy, including for the Auto update.
+                SkillService::sync_to_app_dir("shared", &app, SyncMethod::Copy).unwrap();
+                let app_dest = SkillService::get_app_skills_dir(&app)
+                    .unwrap()
+                    .join("shared");
+                let mtime = fs::metadata(app_dest.join("SKILL.md"))
+                    .unwrap()
+                    .modified()
+                    .unwrap();
+                fs::remove_dir_all(source.join("to_file")).unwrap();
+                fs::write(source.join("to_file"), b"new file").unwrap();
+                fs::remove_file(source.join("to_dir")).unwrap();
+                fs::create_dir_all(source.join("to_dir/nested")).unwrap();
+                fs::write(source.join("to_dir/nested/new"), b"new child").unwrap();
+
+                in_place::with_cleanup_failure(&app_dest, || {
+                    SkillService::sync_updated_skill_to_app("shared", &app, method)
+                })
+                .unwrap();
+                assert_eq!(fs::read(app_dest.join("to_file")).unwrap(), b"new file");
+                assert_eq!(
+                    fs::read(app_dest.join("to_dir/nested/new")).unwrap(),
+                    b"new child"
+                );
+                assert_eq!(
+                    fs::metadata(app_dest.join("SKILL.md"))
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    mtime
+                );
+                assert!(Database::open_for_skill_publication()
+                    .unwrap()
+                    .get_installed_skill(&installed.id)
+                    .unwrap()
+                    .is_some());
+            }
+        }
+    }
+
+    #[test]
+    #[serial(home_settings)]
     fn pinned_first_install_metadata_failure_rolls_back_and_retries() {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
@@ -4201,6 +4392,10 @@ mod tests {
         // Model directories left behind by a previous rollback on Windows.
         fs::create_dir_all(dest.join("references/empty")).unwrap();
         fs::create_dir_all(dest.join("leftover/empty")).unwrap();
+        let app_dest = SkillService::get_app_skills_dir(&AppType::Claude)
+            .unwrap()
+            .join(&installed.directory);
+        fs::create_dir_all(app_dest.join("leftover/empty")).unwrap();
         let db = Database::init().unwrap();
         db.conn
             .lock()
@@ -4254,6 +4449,8 @@ mod tests {
         );
         assert!(dest.join("leftover/empty").is_dir());
         assert_no_pinned_staging(&ssot);
+        assert!(app_dest.join("leftover/empty").is_dir());
+        assert_eq!(fs::read(app_dest.join("SKILL.md")).unwrap(), b"# pinned\n");
     }
 
     #[test]
@@ -4265,9 +4462,9 @@ mod tests {
         let _state_guard = skill_state_write_guard();
         let (source, installed) = pinned_source_fixture(home.path());
         let ssot = SkillService::get_ssot_dir().unwrap();
-        let app_dir = SkillService::get_app_skills_dir(&AppType::Claude).unwrap();
-        fs::create_dir_all(app_dir.parent().unwrap()).unwrap();
-        fs::write(&app_dir, "user blocker").unwrap();
+        // Target ownership now fails before DB writes. Exercise the rollback
+        // branch with a source that fails sync validation after metadata save.
+        fs::remove_file(source.join("SKILL.md")).unwrap();
         let db = Database::init().unwrap();
         db.conn
             .lock()
@@ -4287,8 +4484,8 @@ mod tests {
         );
         assert!(db.get_installed_skill(&installed.id).unwrap().is_some());
         assert_eq!(
-            fs::read(ssot.join("shared/SKILL.md")).unwrap(),
-            b"# pinned\n"
+            fs::read(ssot.join("shared/references/detail.md")).unwrap(),
+            b"new detail\n"
         );
         assert!(fs::read_dir(&ssot).unwrap().any(|entry| {
             let entry = entry.unwrap();
