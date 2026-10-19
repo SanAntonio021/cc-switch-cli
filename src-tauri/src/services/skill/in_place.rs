@@ -739,6 +739,8 @@ mod tests {
 
     #[test]
     fn in_place_journal_total_writes_grow_linearly() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         fn exercise(count: usize) -> usize {
             let temp = tempfile::tempdir().unwrap();
             let source = temp.path().join("source");
@@ -814,6 +816,8 @@ mod tests {
 
     #[test]
     fn in_place_interrupted_progress_retains_recovery_evidence() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         for (event, after, partial_tail) in [
             ("intent", true, false),
             ("mutated", false, false),
@@ -878,6 +882,8 @@ mod tests {
 
     #[test]
     fn in_place_progress_failure_keeps_evidence_and_refuses_further_appends() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let mut update = Update::prepare(&source, &dest).unwrap();
         let stage = update.stage.clone();
@@ -906,6 +912,8 @@ mod tests {
 
     #[test]
     fn in_place_changes_delete_add_and_rollback() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let before = inventory(&dest).unwrap().files;
         let same = dest.join("same");
@@ -939,6 +947,8 @@ mod tests {
 
     #[test]
     fn in_place_noop_and_new_destination() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (temp, source, _) = fixture();
         let dest = temp.path().join("new/nested/dest");
         let mut update = Update::prepare(&source, &dest).unwrap();
@@ -953,6 +963,8 @@ mod tests {
 
     #[test]
     fn in_place_same_path_and_overlap_rejected() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         assert!(Update::prepare(&source, &source).is_err());
         assert!(Update::prepare(&source, &source.join("child")).is_err());
@@ -961,6 +973,8 @@ mod tests {
 
     #[test]
     fn in_place_external_change_before_apply_is_not_touched() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let mut update = Update::prepare(&source, &dest).unwrap();
         fs::write(dest.join("same"), "edit").unwrap();
@@ -972,6 +986,8 @@ mod tests {
 
     #[test]
     fn in_place_new_destination_rollback_keeps_directories() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (temp, source, _) = fixture();
         let dest = temp.path().join("new");
         let mut update = Update::prepare(&source, &dest).unwrap();
@@ -984,8 +1000,9 @@ mod tests {
 
     #[test]
     fn in_place_config_parent_alias_keeps_internal_link_protection() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (temp, source, _) = fixture();
-        let _env = crate::test_support::TestEnvGuard::isolated(temp.path());
         let real = temp.path().join("real");
         let alias = temp.path().join("alias");
         fs::create_dir_all(real.join(".cc-switch/skills")).unwrap();
@@ -1024,6 +1041,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn in_place_symlink_rejected_in_both_trees_and_ancestors() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         use std::os::unix::fs::symlink;
         let (temp, source, dest) = fixture();
         symlink(&dest, source.join("link")).unwrap();
@@ -1038,6 +1057,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn in_place_unix_executable_permissions_and_rollback() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         use std::os::unix::fs::PermissionsExt;
         let (_temp, source, dest) = fixture();
         // Identical bytes must still produce a permission-only transaction entry.
@@ -1072,6 +1093,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn in_place_external_permission_edit_is_preserved() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         use std::os::unix::fs::PermissionsExt;
         let (_temp, source, dest) = fixture();
         fs::set_permissions(source.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -1089,6 +1112,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn in_place_windows_case_only_names_rejected_before_mutation() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let before = inventory(&dest).unwrap();
         fs::remove_file(source.join("a")).unwrap();
@@ -1111,6 +1136,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn in_place_windows_readonly_mutation_rejected_before_update() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let path = source.join("a");
         let mut readonly = fs::metadata(&path).unwrap().permissions();
@@ -1128,6 +1155,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn in_place_windows_reparse_rejected() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         use std::os::windows::fs::symlink_dir;
         let (_temp, source, dest) = fixture();
         match symlink_dir(&dest, source.join("link")) {
@@ -1147,6 +1176,8 @@ mod tests {
 
     #[test]
     fn in_place_injected_failure_rolls_back_only_touched_files() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let before = inventory(&dest).unwrap().files;
         let mut update = Update::prepare(&source, &dest).unwrap();
@@ -1162,6 +1193,8 @@ mod tests {
 
     #[test]
     fn in_place_rollback_failure_preserves_evidence_and_can_retry() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let mut update = Update::prepare(&source, &dest).unwrap();
         update.fail_apply = Some(2);
@@ -1190,6 +1223,8 @@ mod tests {
 
     #[test]
     fn in_place_external_edits_survive_rollback() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let mut update = Update::prepare(&source, &dest).unwrap();
         update.apply().unwrap();
@@ -1210,6 +1245,8 @@ mod tests {
 
     #[test]
     fn in_place_drop_and_panic_preserve_evidence() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         let mut update = Update::prepare(&source, &dest).unwrap();
         let stage = update.stage.clone();
@@ -1225,6 +1262,8 @@ mod tests {
 
     #[test]
     fn in_place_collision_preflight_does_not_mutate() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
         fs::create_dir(dest.join("sub/add")).unwrap();
         let before = inventory(&dest).unwrap().files;
@@ -1240,6 +1279,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn in_place_windows_held_directories_without_share_delete() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         use std::os::windows::fs::OpenOptionsExt;
         let (_temp, source, dest) = fixture();
         let _root = fs::OpenOptions::new()
@@ -1263,6 +1304,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn in_place_windows_locked_individual_file() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         use std::os::windows::fs::OpenOptionsExt;
         let (_temp, source, dest) = fixture();
         let before = inventory(&dest).unwrap().files;
@@ -1280,6 +1323,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn in_place_windows_locked_rollback_retains_backup() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         use std::os::windows::fs::OpenOptionsExt;
         let (_temp, source, dest) = fixture();
         let mut update = Update::prepare(&source, &dest).unwrap();

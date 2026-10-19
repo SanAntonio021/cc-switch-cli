@@ -35,12 +35,18 @@ fn failure(message: impl Into<String>) -> AppError {
 impl SkillService {
     // Caller holds the skill write guard, including the post-download recheck.
     pub(super) fn reject_pinned_existing_install(name: &str) -> Result<(), AppError> {
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
+        let dest = Self::get_ssot_dir()?.join(name);
+        let destination_exists = match fs::symlink_metadata(&dest) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(AppError::io(&dest, error)),
+        };
         if db
             .get_all_installed_skills()?
             .values()
             .any(|s| s.directory.eq_ignore_ascii_case(name))
-            || Self::get_ssot_dir()?.join(name).exists()
+            || destination_exists
         {
             return Err(AppError::InvalidInput("Pinned install requires a new skill; use skills update NAME --source-commit SHA for an existing skill".into()));
         }
@@ -415,14 +421,55 @@ mod targeted_download_tests {
     }
     #[test]
     #[serial_test::serial(home_settings)]
-    fn pinned_install_rejects_existing_without_mutation() {
+    fn pinned_install_checks_preserve_unrelated_state_on_success_and_rejection() {
         let temp = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(temp.path());
+        let _state_guard = skill_state_write_guard();
+        let db = Database::init().unwrap();
+        db.set_setting("unrelated-pinned-test", "preserve me")
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            assert!(
+                conn.execute(
+                    "UPDATE proxy_config SET enabled=0, auto_failover_enabled=1",
+                    [],
+                )
+                .unwrap()
+                    > 0
+            );
+        }
+        let proxy_flags = || {
+            let conn = db.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT app_type,enabled,auto_failover_enabled FROM proxy_config ORDER BY app_type",
+            ).unwrap();
+            let flags = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            flags
+        };
+        let before = proxy_flags();
         assert!(SkillService::reject_pinned_existing_install("demo").is_ok());
+        assert_eq!(proxy_flags(), before);
         let root = SkillService::get_ssot_dir().unwrap().join("demo");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("SKILL.md"), b"old").unwrap();
         assert!(SkillService::reject_pinned_existing_install("demo").is_err());
+        assert_eq!(proxy_flags(), before);
+        assert_eq!(
+            db.get_setting("unrelated-pinned-test").unwrap().as_deref(),
+            Some("preserve me")
+        );
+        assert!(db.get_all_installed_skills().unwrap().is_empty());
         assert_eq!(fs::read(root.join("SKILL.md")).unwrap(), b"old");
     }
     #[test]

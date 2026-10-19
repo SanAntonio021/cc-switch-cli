@@ -3052,6 +3052,96 @@ impl SkillService {
         Ok(())
     }
 
+    /// Pinned first installs only. Caller holds the write guard through rollback
+    /// and cleanup; an existing, unregistered SSOT must never be adopted.
+    fn install_pinned_source(
+        source: &Path,
+        mut installed: InstalledSkill,
+        app: &AppType,
+    ) -> Result<InstalledSkill, AppError> {
+        Self::require_valid_directory(&installed.directory)?;
+        Self::reject_pinned_existing_install(&installed.directory)?;
+        let db = Database::open_for_skill_publication()?;
+        if db.get_installed_skill(&installed.id)?.is_some() {
+            return Err(AppError::InvalidInput(
+                "Pinned skill identity already exists".into(),
+            ));
+        }
+        let sync_method = Self::get_sync_method()?;
+        let dest = in_place::managed_path(&Self::get_ssot_dir()?.join(&installed.directory))?;
+        let mut update = in_place::Update::prepare(source, &dest)?;
+
+        // The transaction removes new files but deliberately preserves directories.
+        // Record only this source's directories, deepest first, for empty-only
+        // cleanup after a verified rollback. Never recursively delete the SSOT.
+        fn directories(
+            source: &Path,
+            dest: &Path,
+            dirs: &mut Vec<PathBuf>,
+        ) -> Result<(), AppError> {
+            for entry in fs::read_dir(source).map_err(|e| AppError::io(source, e))? {
+                let entry = entry.map_err(|e| AppError::io(source, e))?;
+                if entry
+                    .file_type()
+                    .map_err(|e| AppError::io(entry.path(), e))?
+                    .is_dir()
+                {
+                    directories(&entry.path(), &dest.join(entry.file_name()), dirs)?;
+                }
+            }
+            dirs.push(dest.to_path_buf());
+            Ok(())
+        }
+        let mut created_dirs = Vec::new();
+        directories(source, &dest, &mut created_dirs)?;
+        let mut registered = false;
+        let result = (|| {
+            update.apply()?;
+            installed.content_hash = Some(Self::compute_dir_hash(&dest)?);
+            Self::preflight_pi_skill_destination(&dest, &installed.directory, app)?;
+            db.save_skill(&installed)?;
+            registered = true;
+            Self::sync_to_app_dir(&installed.directory, app, sync_method)
+        })();
+        if let Err(error) = result {
+            if registered {
+                if let Err(rollback) = db.delete_skill(&installed.id) {
+                    // Keep files and the journal if the row could not be removed.
+                    return Err(AppError::Message(format!(
+                        "Pinned install failed ({error}); metadata rollback failed ({rollback}); SSOT and recovery journal retained"
+                    )));
+                }
+            }
+            if let Err(rollback) = update.rollback() {
+                return Err(AppError::Message(format!(
+                    "Pinned install failed ({error}); rollback failed ({rollback})"
+                )));
+            }
+            for dir in created_dirs {
+                match fs::remove_dir(&dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(cleanup) => return Err(AppError::Message(format!(
+                        "Pinned install failed ({error}); file rollback verified; empty directory cleanup failed ({}: {cleanup}); recovery journal retained",
+                        dir.display()
+                    ))),
+                }
+            }
+            if let Err(cleanup) = update.commit() {
+                return Err(AppError::Message(format!(
+                    "Pinned install failed ({error}); rollback verified; staging cleanup failed ({cleanup})"
+                )));
+            }
+            return Err(error);
+        }
+        // Metadata and app sync succeeded. Cleanup failure must not report an
+        // installation failure for a skill that is already installed.
+        if let Err(error) = update.commit() {
+            log::warn!("Pinned install staging cleanup failed: {error}");
+        }
+        Ok(installed)
+    }
+
     pub fn toggle_app(directory_or_id: &str, app: &AppType, enabled: bool) -> Result<(), AppError> {
         let _state_guard = skill_state_write_guard();
         let mut index = Self::load_index_unlocked()?;
@@ -3317,7 +3407,7 @@ impl SkillService {
         let ssot_dir = Self::get_ssot_dir()?;
         let dest = ssot_dir.join(&install_name);
         Self::reject_unmanaged_install_collision(&dest, &install_name, &new_repo)?;
-        if !dest.exists() {
+        if source_commit.is_none() && !dest.exists() {
             let source = downloaded_source
                 .as_ref()
                 .map(|(_, source)| source)
@@ -3346,6 +3436,15 @@ impl SkillService {
             updated_at: 0,
         };
 
+        if source_commit.is_some() {
+            let source = downloaded_source
+                .as_ref()
+                .map(|(_, source)| source)
+                .ok_or_else(|| {
+                    AppError::Message("Pinned source missing after download; retry".into())
+                })?;
+            return Self::install_pinned_source(source, installed, app);
+        }
         let db = Database::open_for_skill_publication()?;
         Self::persist_and_sync_new_skill(&db, &installed, app, Self::get_sync_method()?)?;
 
@@ -3933,6 +4032,184 @@ mod tests {
             content_hash: None,
             updated_at: 0,
         }
+    }
+
+    fn pinned_source_fixture(home: &Path) -> (PathBuf, InstalledSkill) {
+        let source = home.join("downloaded");
+        fs::create_dir_all(source.join("references/empty")).unwrap();
+        fs::write(source.join("SKILL.md"), "# pinned\n").unwrap();
+        fs::write(source.join("references/detail.md"), "new detail\n").unwrap();
+        let mut installed = repository_skill(Some(
+            "https://github.com/owner/repo/blob/main/shared/SKILL.md",
+        ));
+        installed.apps = SkillApps::only(&AppType::Claude);
+        (source, installed)
+    }
+
+    fn assert_no_pinned_staging(ssot: &Path) {
+        assert!(fs::read_dir(ssot).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".skill-in-place-")));
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_first_install_metadata_failure_rolls_back_and_retries() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let _pi = crate::pi_config::test_support::TestAgentDir::new();
+        SkillService::set_sync_method(SyncMethod::Copy).unwrap();
+        let _state_guard = skill_state_write_guard();
+        let (source, installed) = pinned_source_fixture(home.path());
+        let ssot = SkillService::get_ssot_dir().unwrap();
+        let db = Database::init().unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_pinned_save BEFORE INSERT ON skills
+             BEGIN SELECT RAISE(ABORT, 'injected pinned metadata failure'); END;",
+            )
+            .unwrap();
+
+        let error =
+            SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected pinned metadata failure"),
+            "{error}"
+        );
+        assert!(!ssot.join(&installed.directory).exists());
+        assert!(db.get_installed_skill(&installed.id).unwrap().is_none());
+        assert_no_pinned_staging(&ssot);
+        SkillService::reject_pinned_existing_install(&installed.directory).unwrap();
+
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_pinned_save;")
+            .unwrap();
+        let result =
+            SkillService::install_pinned_source(&source, installed, &AppType::Claude).unwrap();
+        assert!(result.content_hash.is_some());
+        assert!(db.get_installed_skill(&result.id).unwrap().is_some());
+        assert_eq!(
+            fs::read(ssot.join("shared/references/detail.md")).unwrap(),
+            b"new detail\n"
+        );
+        assert_no_pinned_staging(&ssot);
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_first_install_sync_failure_rolls_back_and_retries() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let _pi = crate::pi_config::test_support::TestAgentDir::new();
+        SkillService::set_sync_method(SyncMethod::Copy).unwrap();
+        let _state_guard = skill_state_write_guard();
+        let (source, installed) = pinned_source_fixture(home.path());
+        let ssot = SkillService::get_ssot_dir().unwrap();
+        let app_dir = SkillService::get_app_skills_dir(&AppType::Claude).unwrap();
+        fs::create_dir_all(app_dir.parent().unwrap()).unwrap();
+        fs::write(&app_dir, "user blocker").unwrap();
+        let db = Database::init().unwrap();
+
+        SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
+            .unwrap_err();
+        assert!(db.get_installed_skill(&installed.id).unwrap().is_none());
+        assert!(!ssot.join(&installed.directory).exists());
+        assert_eq!(fs::read(&app_dir).unwrap(), b"user blocker");
+        assert_no_pinned_staging(&ssot);
+        SkillService::reject_pinned_existing_install(&installed.directory).unwrap();
+
+        fs::remove_file(&app_dir).unwrap();
+        SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude).unwrap();
+        assert_eq!(
+            fs::read(app_dir.join("shared/SKILL.md")).unwrap(),
+            b"# pinned\n"
+        );
+        assert!(db.get_installed_skill(&installed.id).unwrap().is_some());
+        // A registered skill is rejected even if its SSOT directory is absent.
+        let moved = ssot.join("moved");
+        fs::rename(ssot.join("shared"), &moved).unwrap();
+        SkillService::reject_pinned_existing_install("SHARED").unwrap_err();
+        assert_eq!(fs::read(moved.join("SKILL.md")).unwrap(), b"# pinned\n");
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_first_install_preserves_unregistered_directories_and_files() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let _pi = crate::pi_config::test_support::TestAgentDir::new();
+        let _state_guard = skill_state_write_guard();
+        let (source, installed) = pinned_source_fixture(home.path());
+        let ssot = SkillService::get_ssot_dir().unwrap();
+        let dest = ssot.join(&installed.directory);
+        fs::create_dir(&dest).unwrap();
+        SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
+            .unwrap_err();
+        assert!(dest.is_dir());
+        fs::write(dest.join("SKILL.md"), "user original").unwrap();
+        SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
+            .unwrap_err();
+        assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"user original");
+        assert!(!dest.join("references").exists());
+        assert!(Database::open_for_skill_publication()
+            .unwrap()
+            .get_installed_skill(&installed.id)
+            .unwrap()
+            .is_none());
+        assert_no_pinned_staging(&ssot);
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_first_install_retains_recovery_if_metadata_rollback_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let _pi = crate::pi_config::test_support::TestAgentDir::new();
+        let _state_guard = skill_state_write_guard();
+        let (source, installed) = pinned_source_fixture(home.path());
+        let ssot = SkillService::get_ssot_dir().unwrap();
+        let app_dir = SkillService::get_app_skills_dir(&AppType::Claude).unwrap();
+        fs::create_dir_all(app_dir.parent().unwrap()).unwrap();
+        fs::write(&app_dir, "user blocker").unwrap();
+        let db = Database::init().unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_pinned_delete BEFORE DELETE ON skills
+             BEGIN SELECT RAISE(ABORT, 'injected metadata rollback failure'); END;",
+            )
+            .unwrap();
+
+        let error =
+            SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("metadata rollback failed"),
+            "{error}"
+        );
+        assert!(db.get_installed_skill(&installed.id).unwrap().is_some());
+        assert_eq!(
+            fs::read(ssot.join("shared/SKILL.md")).unwrap(),
+            b"# pinned\n"
+        );
+        assert!(fs::read_dir(&ssot).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".skill-in-place-")
+                && entry.path().join("journal.json").is_file()
+        }));
     }
 
     fn poisoned_skill(id: &str, directory: &str) -> InstalledSkill {
