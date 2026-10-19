@@ -1,6 +1,8 @@
 //! File-content transaction. The caller holds the skill write lock through DB commit.
 //!
-//! Directories are never replaced or removed, including on rollback. This is not an
+//! Directories are retained except where a file/directory conversion requires
+//! removing an empty directory; those operations are journaled and reversible.
+//! Unrelated directories are never replaced or removed. This is not an
 //! interprocess lock: callers must exclude simultaneous writers for race-free use.
 //! Content checks detect observed external edits, but cannot provide filesystem CAS.
 //! Staging is deliberately retained after apply until explicit commit; Drop never
@@ -15,6 +17,8 @@
 //! Windows case-only renames and case-ambiguous file/directory names are rejected
 //! during prepare, even on case-sensitive volumes; directory renames are unsupported.
 //! File permissions mean Unix mode bits or Windows readonly, not ACLs/ownership.
+//! Conversion journals also contain directory inventories and directory intent/
+//! mutated events. Replay these in order with file events; undo in reverse order.
 
 use crate::error::AppError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -116,6 +120,30 @@ struct Inventory {
     files: Files,
     permissions: BTreeMap<PathBuf, fs::Permissions>,
     dirs: BTreeSet<PathBuf>,
+    dir_permissions: BTreeMap<PathBuf, fs::Permissions>,
+}
+
+#[derive(Clone)]
+enum Mutation {
+    File(PathBuf),
+    RemoveDir(PathBuf),
+    CreateDir(PathBuf),
+}
+
+impl Mutation {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(path) | Self::RemoveDir(path) | Self::CreateDir(path) => path,
+        }
+    }
+
+    fn events(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::File(_) => ("intent", "mutated"),
+            Self::RemoveDir(_) => ("remove_dir_intent", "remove_dir_mutated"),
+            Self::CreateDir(_) => ("create_dir_intent", "create_dir_mutated"),
+        }
+    }
 }
 
 pub(super) struct Update {
@@ -126,6 +154,11 @@ pub(super) struct Update {
     before_permissions: BTreeMap<PathBuf, fs::Permissions>,
     after_permissions: BTreeMap<PathBuf, fs::Permissions>,
     dirs: BTreeSet<PathBuf>,
+    before_dirs: BTreeSet<PathBuf>,
+    removed_dirs: BTreeMap<PathBuf, fs::Permissions>,
+    conversion_dirs: BTreeSet<PathBuf>,
+    operations: Vec<Mutation>,
+    touched_operations: Vec<Mutation>,
     changes: Vec<PathBuf>,
     // Only successfully mutated files are eligible for automatic rollback.
     touched: Vec<PathBuf>,
@@ -228,6 +261,9 @@ fn inventory(root: &Path) -> Result<Inventory, AppError> {
         };
         let relative = path.strip_prefix(root).expect("descendant").to_path_buf();
         if meta.is_dir() {
+            result
+                .dir_permissions
+                .insert(relative.clone(), meta.permissions());
             result.dirs.insert(relative);
             for entry in fs::read_dir(path).map_err(|e| AppError::io(path, e))? {
                 let entry = entry.map_err(|e| AppError::io(path, e))?;
@@ -250,6 +286,15 @@ fn inventory(root: &Path) -> Result<Inventory, AppError> {
         walk(root, root, &mut result)?;
     }
     Ok(result)
+}
+
+// Unregistered first-install targets may only reuse directories left by rollback.
+// Inventory rejects files at the root, links/reparse nodes and special nodes too.
+pub(super) fn require_file_empty_tree(root: &Path) -> Result<(), AppError> {
+    if !inventory(root)?.files.is_empty() {
+        return Err(error(root, "unregistered destination contains files"));
+    }
+    Ok(())
 }
 
 fn verify(root: &Path, expected: &Files) -> Result<(), AppError> {
@@ -284,17 +329,34 @@ fn matches_state(
     permissions: Option<&fs::Permissions>,
 ) -> Result<bool, AppError> {
     let actual = read_optional(path)?;
-    let actual_permissions = metadata(path)?.map(|m| m.permissions());
+    let actual_permissions = reachable_metadata(path)?
+        .filter(|m| m.is_file())
+        .map(|m| m.permissions());
     Ok(actual.as_ref() == bytes && same_permissions(actual_permissions.as_ref(), permissions))
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
-    safe_path(path)?;
-    match metadata(path)? {
+    match reachable_metadata(path)? {
         None => Ok(None),
         Some(meta) if meta.is_file() => fs::read(path).map(Some).map_err(|e| AppError::io(path, e)),
-        Some(_) => Err(error(path, "file/directory collision")),
+        Some(_) => Ok(None),
     }
+}
+
+// A file ancestor means this descendant has no file/dir node. This matters when
+// retrying rollback after its conversion root has already been restored to a file.
+// Inspect every reachable ancestor without following links or reparse points.
+fn reachable_metadata(path: &Path) -> Result<Option<Metadata>, AppError> {
+    let mut ancestors: Vec<_> = path.ancestors().collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        match metadata(ancestor)? {
+            Some(meta) if ancestor == path => return Ok(Some(meta)),
+            Some(meta) if meta.is_dir() => {}
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 fn ensure_dir(path: &Path) -> Result<(), AppError> {
@@ -363,16 +425,18 @@ impl Update {
         let old = inventory(&dest)?;
         #[cfg(windows)]
         reject_case_ambiguities(&dest, &old, &next)?;
-        for relative in next.files.keys() {
-            if old.dirs.contains(relative) {
-                return Err(error(&dest.join(relative), "file/directory collision"));
-            }
-        }
-        for relative in &next.dirs {
-            if old.files.contains_key(relative) {
-                return Err(error(&dest.join(relative), "file/directory collision"));
-            }
-        }
+        let removed_dirs: BTreeMap<_, _> = old
+            .dir_permissions
+            .iter()
+            .filter(|(dir, _)| dir.ancestors().any(|p| next.files.contains_key(p)))
+            .map(|(dir, permissions)| (dir.clone(), permissions.clone()))
+            .collect();
+        let conversion_dirs: BTreeSet<_> = next
+            .dirs
+            .iter()
+            .filter(|dir| dir.ancestors().any(|p| old.files.contains_key(p)))
+            .cloned()
+            .collect();
         let changes: Vec<PathBuf> = old
             .files
             .keys()
@@ -385,6 +449,28 @@ impl Update {
                     || !same_permissions(old.permissions.get(p), next.permissions.get(p))
             })
             .collect();
+        let mut operations: Vec<_> = changes.iter().cloned().map(Mutation::File).collect();
+        if !removed_dirs.is_empty() || !conversion_dirs.is_empty() {
+            // Delete old files first, then empty conversion directories deepest
+            // first. Only then can new directories and new files occupy them.
+            operations = changes
+                .iter()
+                .filter(|p| !next.files.contains_key(*p))
+                .cloned()
+                .map(Mutation::File)
+                .collect();
+            let mut removals: Vec<_> = removed_dirs.keys().cloned().collect();
+            removals.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+            operations.extend(removals.into_iter().map(Mutation::RemoveDir));
+            operations.extend(conversion_dirs.iter().cloned().map(Mutation::CreateDir));
+            operations.extend(
+                changes
+                    .iter()
+                    .filter(|p| next.files.contains_key(*p))
+                    .cloned()
+                    .map(Mutation::File),
+            );
+        }
         // Windows cannot atomically overwrite/remove a readonly file. Refuse
         // such mutations before starting, rather than create an update that
         // cannot be undone after a later file or database failure.
@@ -418,6 +504,11 @@ impl Update {
             before: old.files,
             after: next.files,
             dirs: next.dirs,
+            before_dirs: old.dirs,
+            removed_dirs,
+            conversion_dirs,
+            operations,
+            touched_operations: Vec::new(),
             before_permissions: old.permissions,
             after_permissions: next.permissions,
             changes,
@@ -482,7 +573,12 @@ impl Update {
             .collect();
         let data = serde_json::to_vec_pretty(&serde_json::json!({
             "version": 2, "destination": self.dest, "phase": "prepared",
-            "progress_log": "progress.jsonl", "files": entries
+            "progress_log": "progress.jsonl", "files": entries,
+            "before_directories": self.before_dirs,
+            "created_conversion_directories": self.conversion_dirs,
+            "removed_directories": self.removed_dirs.iter().map(|(path, permissions)|
+                serde_json::json!({"path": path, "permissions": permission_bits(permissions)})
+            ).collect::<Vec<_>>()
         }))
         .map_err(|e| error(&self.stage.join("journal.json"), e))?;
         replace(&self.stage.join("journal.json"), &data)?;
@@ -569,38 +665,71 @@ impl Update {
 
     fn apply_inner(&mut self) -> Result<(), AppError> {
         verify_state(&self.dest, &self.before, &self.before_permissions)?;
-        // Check newly introduced collisions even if the regular-file inventory agrees.
-        for relative in &self.changes {
-            read_optional(&self.dest.join(relative))?;
-        }
-        for relative in &self.dirs {
-            safe_path(&self.dest.join(relative))?;
+        // Empty directory edits can also invalidate a planned conversion.
+        if inventory(&self.dest)?.dirs != self.before_dirs {
+            return Err(error(&self.dest, "directory inventory conflict"));
         }
         self.journal("applying", "phase", None)?;
         for relative in &self.dirs {
-            ensure_dir(&self.dest.join(relative))?;
-        }
-        for relative in self.changes.clone() {
-            let path = self.dest.join(&relative);
-            if !matches_state(
-                &path,
-                self.before.get(&relative),
-                self.before_permissions.get(&relative),
-            )? {
-                return Err(error(&path, "external change before apply"));
+            if !self.conversion_dirs.contains(relative) {
+                ensure_dir(&self.dest.join(relative))?;
             }
-            self.journal("applying", "intent", Some(&relative))?;
+        }
+        for operation in self.operations.clone() {
+            let relative = operation.path().to_path_buf();
+            let path = self.dest.join(&relative);
+            let (intent, mutated) = operation.events();
+            self.journal("applying", intent, Some(&relative))?;
             #[cfg(test)]
-            if self.fail_apply == Some(self.touched.len() + 1) {
+            if self.fail_apply == Some(self.touched_operations.len() + 1) {
                 return Err(error(&path, "injected apply failure"));
             }
-            if let Some(bytes) = self.after.get(&relative) {
-                replace_with_permissions(&path, bytes, self.after_permissions.get(&relative))?;
-            } else {
-                fs::remove_file(&path).map_err(|e| AppError::io(&path, e))?;
+            match &operation {
+                Mutation::File(_) => {
+                    if !matches_state(
+                        &path,
+                        self.before.get(&relative),
+                        self.before_permissions.get(&relative),
+                    )? {
+                        return Err(error(&path, "external change before apply"));
+                    }
+                    if let Some(bytes) = self.after.get(&relative) {
+                        replace_with_permissions(
+                            &path,
+                            bytes,
+                            self.after_permissions.get(&relative),
+                        )?;
+                    } else {
+                        fs::remove_file(&path).map_err(|e| AppError::io(&path, e))?;
+                    }
+                    self.touched.push(relative.clone());
+                }
+                Mutation::RemoveDir(_) => {
+                    let meta = reachable_metadata(&path)?;
+                    if !meta.as_ref().is_some_and(|m| m.is_dir())
+                        || !same_permissions(
+                            meta.as_ref().map(|m| m.permissions()).as_ref(),
+                            self.removed_dirs.get(&relative),
+                        )
+                    {
+                        return Err(error(&path, "directory changed before conversion"));
+                    }
+                    // Never recursively remove: a concurrent addition must survive.
+                    fs::remove_dir(&path).map_err(|e| AppError::io(&path, e))?;
+                }
+                Mutation::CreateDir(_) => {
+                    if reachable_metadata(&path)?.is_some() {
+                        return Err(error(
+                            &path,
+                            "external directory collision before conversion",
+                        ));
+                    }
+                    safe_path(&path)?;
+                    fs::create_dir(&path).map_err(|e| AppError::io(&path, e))?;
+                }
             }
-            self.touched.push(relative.clone());
-            self.journal("applying", "mutated", Some(&relative))?;
+            self.touched_operations.push(operation);
+            self.journal("applying", mutated, Some(&relative))?;
         }
         verify_state(&self.dest, &self.after, &self.after_permissions)?;
         self.journal("applied", "phase", None)
@@ -613,9 +742,58 @@ impl Update {
 
     fn rollback_inner(&mut self) -> Result<(), AppError> {
         let mut failures = Vec::new();
-        for relative in self.touched.iter().rev() {
+        for operation in self.touched_operations.iter().rev() {
+            let relative = operation.path();
             let path = self.dest.join(relative);
             let restore = (|| {
+                match operation {
+                    Mutation::CreateDir(_) => {
+                        let Some(meta) = reachable_metadata(&path)? else {
+                            return Ok(());
+                        };
+                        if meta.is_file()
+                            && matches_state(
+                                &path,
+                                self.before.get(relative),
+                                self.before_permissions.get(relative),
+                            )?
+                        {
+                            return Ok(());
+                        }
+                        #[cfg(test)]
+                        if self.fail_rollback {
+                            return Err(error(&path, "injected rollback failure"));
+                        }
+                        if !meta.is_dir() {
+                            return Err(error(&path, "external node blocks directory rollback"));
+                        }
+                        // Nonempty means an external file, or an earlier failed
+                        // file rollback. Preserve it and retain recovery evidence.
+                        return fs::remove_dir(&path).map_err(|e| AppError::io(&path, e));
+                    }
+                    Mutation::RemoveDir(_) => {
+                        if let Some(meta) = reachable_metadata(&path)? {
+                            if meta.is_dir()
+                                && same_permissions(
+                                    Some(&meta.permissions()),
+                                    self.removed_dirs.get(relative),
+                                )
+                            {
+                                return Ok(());
+                            }
+                            return Err(error(&path, "external node blocks directory restore"));
+                        }
+                        #[cfg(test)]
+                        if self.fail_rollback {
+                            return Err(error(&path, "injected rollback failure"));
+                        }
+                        safe_path(&path)?;
+                        fs::create_dir(&path).map_err(|e| AppError::io(&path, e))?;
+                        return fs::set_permissions(&path, self.removed_dirs[relative].clone())
+                            .map_err(|e| AppError::io(&path, e));
+                    }
+                    Mutation::File(_) => {}
+                }
                 if matches_state(
                     &path,
                     self.before.get(relative),
@@ -650,6 +828,15 @@ impl Update {
         if let Err(e) = verify_state(&self.dest, &self.before, &self.before_permissions) {
             failures.push(e.to_string());
         }
+        for (relative, permissions) in &self.removed_dirs {
+            let path = self.dest.join(relative);
+            match reachable_metadata(&path) {
+                Ok(Some(meta))
+                    if meta.is_dir()
+                        && same_permissions(Some(&meta.permissions()), Some(permissions)) => {}
+                _ => failures.push(format!("{}: directory rollback conflict", path.display())),
+            }
+        }
         if failures.is_empty() {
             self.journal("rolled_back", "phase", None)?;
             self.rolled_back = true;
@@ -666,10 +853,37 @@ impl Update {
         if self.started && !self.applied && !self.rolled_back {
             return Err(self.context(error(&self.dest, "unresolved transaction; cleanup refused")));
         }
+        #[cfg(test)]
+        if FAIL_CLEANUP_FOR.with(|target| {
+            target.borrow().as_ref().is_some_and(|target| {
+                fs::canonicalize(target).ok().is_some_and(|target| {
+                    fs::canonicalize(&self.dest).ok().as_ref() == Some(&target)
+                })
+            })
+        }) {
+            return Err(self.context(error(&self.stage, "injected staging cleanup failure")));
+        }
         fs::remove_dir_all(&self.stage).map_err(|e| self.context(AppError::io(&self.stage, e)))?;
         self.started = true; // Drop has nothing left to clean.
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_CLEANUP_FOR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_cleanup_failure<T>(dest: &Path, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<PathBuf>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAIL_CLEANUP_FOR.with(|target| *target.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(FAIL_CLEANUP_FOR.with(|target| target.replace(Some(dest.to_path_buf()))));
+    run()
 }
 
 impl Drop for Update {
@@ -1261,19 +1475,194 @@ mod tests {
     }
 
     #[test]
-    fn in_place_collision_preflight_does_not_mutate() {
+    fn in_place_new_directory_collision_preflight_does_not_mutate() {
         let isolation_root = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
         let (_temp, source, dest) = fixture();
+        let mut update = Update::prepare(&source, &dest).unwrap();
         fs::create_dir(dest.join("sub/add")).unwrap();
         let before = inventory(&dest).unwrap().files;
-        assert!(Update::prepare(&source, &dest).is_err());
+        assert!(update.apply().is_err());
         verify(&dest, &before).unwrap();
-        fs::remove_dir(dest.join("sub/add")).unwrap();
-        fs::remove_file(source.join("a")).unwrap();
-        fs::create_dir(source.join("a")).unwrap();
-        assert!(Update::prepare(&source, &dest).is_err());
-        verify(&dest, &before).unwrap();
+        assert!(dest.join("sub/add").is_dir());
+        update.commit().unwrap();
+    }
+
+    fn conversion_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        fs::create_dir_all(source.join("to_dir/nested/empty")).unwrap();
+        fs::create_dir_all(dest.join("to_file/nested/empty")).unwrap();
+        fs::write(source.join("to_dir/nested/new"), b"new child").unwrap();
+        fs::write(source.join("to_file"), b"new file").unwrap();
+        fs::write(dest.join("to_file/nested/old"), b"old child").unwrap();
+        fs::write(dest.join("to_dir"), b"old file").unwrap();
+        for root in [&source, &dest] {
+            fs::create_dir_all(root.join("unchanged/empty")).unwrap();
+            fs::write(root.join("unchanged/stable"), b"stable").unwrap();
+        }
+        (temp, source, dest)
+    }
+
+    fn assert_directory_state(root: &Path, expected: &Inventory) {
+        let actual = inventory(root).unwrap();
+        assert_eq!(actual.dirs, expected.dirs);
+        for (path, permissions) in &expected.dir_permissions {
+            assert!(same_permissions(
+                actual.dir_permissions.get(path),
+                Some(permissions)
+            ));
+        }
+    }
+
+    #[test]
+    fn in_place_file_directory_conversions_commit_and_rollback() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
+        let (_temp, source, dest) = conversion_fixture();
+        let before = inventory(&dest).unwrap();
+        let unchanged = dest.join("unchanged");
+        let file_mtime = fs::metadata(unchanged.join("stable"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let dir_mtime = fs::metadata(&unchanged).unwrap().modified().unwrap();
+        let mut update = Update::prepare(&source, &dest).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(update.stage.join("journal.json")).unwrap()).unwrap();
+        assert_eq!(manifest["removed_directories"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            manifest["created_conversion_directories"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        update.apply().unwrap();
+        let next = inventory(&source).unwrap();
+        verify_state(&dest, &next.files, &next.permissions).unwrap();
+        assert_eq!(inventory(&dest).unwrap().dirs, next.dirs);
+        update.rollback().unwrap();
+        update.rollback().unwrap();
+        verify_state(&dest, &before.files, &before.permissions).unwrap();
+        assert_directory_state(&dest, &before);
+        update.commit().unwrap();
+        let mut update = Update::prepare(&source, &dest).unwrap();
+        update.apply().unwrap();
+        let stage = update.stage.clone();
+        update.commit().unwrap();
+        assert!(!stage.exists());
+        verify_state(&dest, &next.files, &next.permissions).unwrap();
+        assert_eq!(
+            fs::metadata(unchanged.join("stable"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            file_mtime
+        );
+        assert_eq!(
+            fs::metadata(&unchanged).unwrap().modified().unwrap(),
+            dir_mtime
+        );
+    }
+
+    #[test]
+    fn in_place_conversion_failure_at_each_operation_restores_complete_tree() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
+        let (_temp, source, dest) = conversion_fixture();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dest.join("to_file/nested/empty"),
+                fs::Permissions::from_mode(0o751),
+            )
+            .unwrap();
+            fs::set_permissions(dest.join("to_dir"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let before = inventory(&dest).unwrap();
+        let count = Update::prepare(&source, &dest).unwrap().operations.len();
+        for fail in 1..=count {
+            let mut update = Update::prepare(&source, &dest).unwrap();
+            update.fail_apply = Some(fail);
+            let message = update.apply().unwrap_err().to_string();
+            assert!(
+                message.contains("rollback verified"),
+                "operation {fail}: {message}"
+            );
+            verify_state(&dest, &before.files, &before.permissions).unwrap();
+            assert_directory_state(&dest, &before);
+            update.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn in_place_conversion_failed_rollback_retains_evidence_and_retries() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
+        let (_temp, source, dest) = conversion_fixture();
+        let before = inventory(&dest).unwrap();
+        let mut update = Update::prepare(&source, &dest).unwrap();
+        let stage = update.stage.clone();
+        update.apply().unwrap();
+        update.fail_rollback = true;
+        assert!(update.rollback().is_err());
+        assert!(stage.join("backup/to_file/nested/old").is_file());
+        let progress = fs::read_to_string(stage.join("progress.jsonl")).unwrap();
+        assert!(progress.contains("remove_dir_mutated"));
+        assert!(progress.contains("create_dir_mutated"));
+        assert!(!progress.contains("rolled_back"));
+        update.fail_rollback = false;
+        update.rollback().unwrap();
+        update.rollback().unwrap();
+        verify_state(&dest, &before.files, &before.permissions).unwrap();
+        assert_directory_state(&dest, &before);
+        update.commit().unwrap();
+    }
+
+    #[test]
+    fn in_place_conversion_rollback_preserves_external_files() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
+        let (_temp, source, dest) = conversion_fixture();
+        let mut update = Update::prepare(&source, &dest).unwrap();
+        let stage = update.stage.clone();
+        update.apply().unwrap();
+        fs::write(dest.join("to_dir/user-file"), b"external child").unwrap();
+        fs::write(dest.join("to_file"), b"external replacement").unwrap();
+        assert!(update.rollback().is_err());
+        assert_eq!(
+            fs::read(dest.join("to_dir/user-file")).unwrap(),
+            b"external child"
+        );
+        assert_eq!(
+            fs::read(dest.join("to_file")).unwrap(),
+            b"external replacement"
+        );
+        assert_eq!(fs::read(dest.join("unchanged/stable")).unwrap(), b"stable");
+        assert!(stage.join("backup/to_dir").is_file());
+        assert!(stage.join("backup/to_file/nested/old").is_file());
+        drop(update);
+        assert!(stage.join("journal.json").is_file());
+    }
+
+    #[test]
+    fn in_place_cleanup_failure_preserves_applied_tree_and_evidence() {
+        let isolation_root = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(isolation_root.path());
+        let (_temp, source, dest) = fixture();
+        let mut update = Update::prepare(&source, &dest).unwrap();
+        let stage = update.stage.clone();
+        update.apply().unwrap();
+        let error = with_cleanup_failure(&dest, || update.commit()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected staging cleanup failure"));
+        verify(&dest, &inventory(&source).unwrap().files).unwrap();
+        assert!(stage.join("backup/a").is_file());
+        assert_eq!(recovery_state(&stage).0, "applied");
     }
 
     #[cfg(windows)]
