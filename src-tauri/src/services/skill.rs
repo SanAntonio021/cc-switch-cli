@@ -2509,6 +2509,12 @@ impl SkillService {
         }
 
         for kind in ["tree", "blob"] {
+            let prefix = format!("https://github.com/{owner}/{repo}/{kind}/");
+            if let Some((commit, _)) = url.strip_prefix(&prefix).and_then(|s| s.split_once('/')) {
+                if Self::validate_source_commit(commit).is_ok() && !branches.contains(&commit) {
+                    branches.push(commit);
+                }
+            }
             for branch in &branches {
                 let prefix = format!("https://github.com/{owner}/{repo}/{kind}/{branch}/");
                 let Some(raw) = url.strip_prefix(&prefix) else {
@@ -2820,7 +2826,7 @@ impl SkillService {
         updated.readme_url = Some(Self::build_skill_doc_url(
             &owner,
             &name,
-            &used_branch,
+            source_commit.unwrap_or(&used_branch),
             &doc_path,
         ));
         updated.content_hash = Some(content_hash);
@@ -3053,7 +3059,7 @@ impl SkillService {
     }
 
     /// Pinned first installs only. Caller holds the write guard through rollback
-    /// and cleanup; an existing, unregistered SSOT must never be adopted.
+    /// and cleanup; only an unregistered, file-empty directory tree may be reused.
     fn install_pinned_source(
         source: &Path,
         mut installed: InstalledSkill,
@@ -3072,8 +3078,8 @@ impl SkillService {
         let mut update = in_place::Update::prepare(source, &dest)?;
 
         // The transaction removes new files but deliberately preserves directories.
-        // Record only this source's directories, deepest first, for empty-only
-        // cleanup after a verified rollback. Never recursively delete the SSOT.
+        // Record only newly created source directories, deepest first, for
+        // empty-only cleanup. Preserve any directories reused from a prior attempt.
         fn directories(
             source: &Path,
             dest: &Path,
@@ -3089,7 +3095,11 @@ impl SkillService {
                     directories(&entry.path(), &dest.join(entry.file_name()), dirs)?;
                 }
             }
-            dirs.push(dest.to_path_buf());
+            match fs::symlink_metadata(dest) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => dirs.push(dest.to_path_buf()),
+                Err(e) => return Err(AppError::io(dest, e)),
+                Ok(_) => {}
+            }
             Ok(())
         }
         let mut created_dirs = Vec::new();
@@ -3310,14 +3320,17 @@ impl SkillService {
             let _state_guard = skill_state_write_guard();
             if source_commit.is_some() {
                 Self::reject_pinned_existing_install(&install_name)?;
+                true
+            } else {
+                if let Some(existing) =
+                    Self::reuse_existing_install(&discoverable, &install_name, app)?
+                {
+                    return Ok(existing);
+                }
+                let dest = Self::get_ssot_dir()?.join(&install_name);
+                Self::reject_unmanaged_install_collision(&dest, &install_name, &new_repo)?;
+                !dest.exists()
             }
-            if let Some(existing) = Self::reuse_existing_install(&discoverable, &install_name, app)?
-            {
-                return Ok(existing);
-            }
-            let dest = Self::get_ssot_dir()?.join(&install_name);
-            Self::reject_unmanaged_install_collision(&dest, &install_name, &new_repo)?;
-            !dest.exists()
         };
 
         let mut installed_branch = discoverable.repo_branch.clone();
@@ -3388,7 +3401,7 @@ impl SkillService {
             installed_readme_url = Some(Self::build_skill_doc_url(
                 &repo.owner,
                 &repo.name,
-                &used_branch,
+                source_commit.unwrap_or(&used_branch),
                 &doc_path,
             ));
             installed_branch = used_branch;
@@ -3400,13 +3413,17 @@ impl SkillService {
         let _state_guard = skill_state_write_guard();
         if source_commit.is_some() {
             Self::reject_pinned_existing_install(&install_name)?;
-        }
-        if let Some(existing) = Self::reuse_existing_install(&discoverable, &install_name, app)? {
-            return Ok(existing);
+        } else {
+            if let Some(existing) = Self::reuse_existing_install(&discoverable, &install_name, app)?
+            {
+                return Ok(existing);
+            }
         }
         let ssot_dir = Self::get_ssot_dir()?;
         let dest = ssot_dir.join(&install_name);
-        Self::reject_unmanaged_install_collision(&dest, &install_name, &new_repo)?;
+        if source_commit.is_none() {
+            Self::reject_unmanaged_install_collision(&dest, &install_name, &new_repo)?;
+        }
         if source_commit.is_none() && !dest.exists() {
             let source = downloaded_source
                 .as_ref()
@@ -4143,7 +4160,7 @@ mod tests {
 
     #[test]
     #[serial(home_settings)]
-    fn pinned_first_install_preserves_unregistered_directories_and_files() {
+    fn pinned_first_install_preserves_unregistered_files_including_zero_bytes() {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
         let _pi = crate::pi_config::test_support::TestAgentDir::new();
@@ -4151,20 +4168,91 @@ mod tests {
         let (source, installed) = pinned_source_fixture(home.path());
         let ssot = SkillService::get_ssot_dir().unwrap();
         let dest = ssot.join(&installed.directory);
-        fs::create_dir(&dest).unwrap();
-        SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
-            .unwrap_err();
-        assert!(dest.is_dir());
-        fs::write(dest.join("SKILL.md"), "user original").unwrap();
-        SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
-            .unwrap_err();
-        assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"user original");
+        fs::create_dir_all(dest.join("leftover/empty")).unwrap();
+        SkillService::reject_pinned_existing_install(&installed.directory).unwrap();
+        let user_file = dest.join("leftover/empty/.keep");
+        for bytes in [b"".as_slice(), b"user original".as_slice()] {
+            fs::write(&user_file, bytes).unwrap();
+            SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
+                .unwrap_err();
+            assert_eq!(fs::read(&user_file).unwrap(), bytes);
+            assert!(!dest.join("SKILL.md").exists());
+        }
         assert!(!dest.join("references").exists());
         assert!(Database::open_for_skill_publication()
             .unwrap()
             .get_installed_skill(&installed.id)
             .unwrap()
             .is_none());
+        assert_no_pinned_staging(&ssot);
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_first_install_reuses_empty_leftovers_after_failure_but_protects_new_files() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let _pi = crate::pi_config::test_support::TestAgentDir::new();
+        SkillService::set_sync_method(SyncMethod::Copy).unwrap();
+        let _state_guard = skill_state_write_guard();
+        let (source, installed) = pinned_source_fixture(home.path());
+        let ssot = SkillService::get_ssot_dir().unwrap();
+        let dest = ssot.join(&installed.directory);
+        // Model directories left behind by a previous rollback on Windows.
+        fs::create_dir_all(dest.join("references/empty")).unwrap();
+        fs::create_dir_all(dest.join("leftover/empty")).unwrap();
+        let db = Database::init().unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_pinned_save BEFORE INSERT ON skills
+             BEGIN SELECT RAISE(ABORT, 'injected pinned metadata failure'); END;",
+            )
+            .unwrap();
+
+        let error =
+            SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected pinned metadata failure"),
+            "{error}"
+        );
+        assert!(dest.join("references/empty").is_dir());
+        assert!(dest.join("leftover/empty").is_dir());
+        assert!(!dest.join("SKILL.md").exists());
+        assert!(!dest.join("references/detail.md").exists());
+        assert!(db.get_installed_skill(&installed.id).unwrap().is_none());
+        assert_no_pinned_staging(&ssot);
+        SkillService::reject_pinned_existing_install(&installed.directory).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_pinned_save;")
+            .unwrap();
+
+        // A user file appearing between attempts makes the tree unmanaged again.
+        let blocker = dest.join("leftover/empty/.keep");
+        fs::write(&blocker, b"").unwrap();
+        SkillService::install_pinned_source(&source, installed.clone(), &AppType::Claude)
+            .unwrap_err();
+        assert_eq!(fs::read(&blocker).unwrap(), b"");
+        assert!(db.get_installed_skill(&installed.id).unwrap().is_none());
+        assert!(!dest.join("SKILL.md").exists());
+        assert_no_pinned_staging(&ssot);
+        fs::rename(&blocker, home.path().join("preserved-user-file")).unwrap();
+
+        let result =
+            SkillService::install_pinned_source(&source, installed, &AppType::Claude).unwrap();
+        assert!(db.get_installed_skill(&result.id).unwrap().is_some());
+        assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"# pinned\n");
+        assert_eq!(
+            fs::read(dest.join("references/detail.md")).unwrap(),
+            b"new detail\n"
+        );
+        assert!(dest.join("leftover/empty").is_dir());
         assert_no_pinned_staging(&ssot);
     }
 
@@ -4867,11 +4955,17 @@ mod tests {
         fs::create_dir_all(&nested).expect("create nested skill");
         fs::write(nested.join("SKILL.md"), "nested").expect("write nested manifest");
 
-        let skill = repository_skill(Some("https://github.com/owner/repo/blob/main/SKILL.md"));
-        let resolved = SkillService::resolve_update_source(temp.path(), &skill, Some("main"))
-            .expect("exact root metadata should win over a same-named nested skill");
-
-        assert_eq!(resolved, temp.path());
+        for reference in ["main".to_string(), "a".repeat(40)] {
+            let url = format!("https://github.com/owner/repo/blob/{reference}/SKILL.md");
+            let skill = repository_skill(Some(&url));
+            assert_eq!(
+                SkillService::source_path_from_readme(&skill, None),
+                Some(PathBuf::new())
+            );
+            let resolved = SkillService::resolve_update_source(temp.path(), &skill, Some("main"))
+                .expect("exact root metadata should win over a same-named nested skill");
+            assert_eq!(resolved, temp.path());
+        }
     }
 
     #[test]
