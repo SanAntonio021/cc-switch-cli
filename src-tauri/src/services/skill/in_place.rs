@@ -186,11 +186,36 @@ fn safe_path(path: &Path) -> Result<(), AppError> {
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, AppError> {
+    let path = managed_path(path)?;
+    safe_path(&path)?;
+    Ok(path)
+}
+
+// Configuration parents may be aliases (e.g. a mounted home). Resolve only
+// above the declared config root; links inside managed skill trees still fail.
+pub(super) fn managed_path(path: &Path) -> Result<PathBuf, AppError> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(error(path, "parent traversal is not allowed"));
     }
     let path = std::path::absolute(path).map_err(|e| AppError::io(path, e))?;
-    safe_path(&path)?;
+    let mut roots = vec![crate::config::get_app_config_dir()];
+    if let Some(home) = crate::config::home_dir() {
+        roots.push(home.join(".agents"));
+    }
+    for app in super::SkillService::supported_skill_apps() {
+        if let Ok(skills) = super::SkillService::get_app_skills_dir(&app) {
+            if let Some(root) = skills.parent() {
+                roots.push(root.to_path_buf());
+            }
+        }
+    }
+    roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+    for root in roots {
+        let root = std::path::absolute(&root).map_err(|e| AppError::io(&root, e))?;
+        if let Ok(relative) = path.strip_prefix(&root) {
+            return Ok(crate::config::resolve_config_dir(&root)?.join(relative));
+        }
+    }
     Ok(path)
 }
 
@@ -955,6 +980,45 @@ mod tests {
         assert!(dest.join("sub").is_dir());
         assert!(inventory(&dest).unwrap().files.is_empty());
         update.commit().unwrap();
+    }
+
+    #[test]
+    fn in_place_config_parent_alias_keeps_internal_link_protection() {
+        let (temp, source, _) = fixture();
+        let _env = crate::test_support::TestEnvGuard::isolated(temp.path());
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(real.join(".cc-switch/skills")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        #[cfg(windows)]
+        match std::os::windows::fs::symlink_dir(&real, &alias) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(1314) => return,
+            Err(e) => panic!("create parent alias: {e}"),
+        }
+        let config = alias.join(".cc-switch");
+        std::env::set_var("CC_SWITCH_CONFIG_DIR", &config);
+        let dest = config.join("skills/example");
+        let mut update = Update::prepare(&source, &dest).unwrap();
+        update.apply().unwrap();
+        update.commit().unwrap();
+        assert_eq!(
+            fs::read(real.join(".cc-switch/skills/example/a")).unwrap(),
+            b"new"
+        );
+        let internal = config.join("skills/internal");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &internal).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&source, &internal).unwrap();
+        assert!(Update::prepare(&source, &internal).is_err());
+        assert!(Update::prepare(&source, &internal.join("child")).is_err());
+        // A configured root itself cannot be a link either.
+        std::env::set_var("CC_SWITCH_CONFIG_DIR", &alias);
+        assert!(Update::prepare(&source, &alias.join("skills/example")).is_err());
+        // Unrelated ancestor aliases do not gain trust from configuration.
+        assert!(Update::prepare(&source, &alias.join("unmanaged/example")).is_err());
     }
 
     #[cfg(unix)]

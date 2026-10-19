@@ -821,14 +821,14 @@ impl SkillService {
         // Default repository initialization is a write, so keep it and the
         // following multi-query snapshot in one exclusive state window.
         let _state_guard = skill_state_write_guard();
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         let _ = db.init_default_skill_repos();
         Self::load_index_from_db(&db)
     }
 
     /// Caller must hold either the Skills state read or write guard.
     pub(crate) fn load_index_unlocked() -> Result<SkillsIndex, AppError> {
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         Self::load_index_from_db(&db)
     }
 
@@ -876,7 +876,7 @@ impl SkillService {
 
     /// Caller must hold the Skills state write guard.
     fn save_index_unlocked(index: &SkillsIndex) -> Result<(), AppError> {
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
 
         crate::settings::set_skill_sync_method(index.sync_method)?;
 
@@ -902,7 +902,7 @@ impl SkillService {
             return Ok(0);
         }
 
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         let ssot_dir = Self::get_ssot_dir()?;
         let mut created = 0usize;
 
@@ -2575,7 +2575,7 @@ impl SkillService {
     /// Check for repository-backed Skill updates. This is only called by
     /// explicit CLI/TUI actions; no background or startup check is scheduled.
     pub async fn check_updates(&self) -> Result<SkillUpdateCheckResult, AppError> {
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         let installed = db.get_all_installed_skills()?;
         let ssot_dir = Self::get_ssot_dir()?;
         let mut groups: HashMap<(String, String, String), Vec<InstalledSkill>> = HashMap::new();
@@ -2709,7 +2709,7 @@ impl SkillService {
         if let Some(commit) = source_commit {
             Self::validate_source_commit(commit)?;
         }
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         let mut skill = db
             .get_installed_skill(skill_id)?
             .ok_or_else(|| AppError::Message(format!("Skill not found: {skill_id}")))?;
@@ -2933,18 +2933,18 @@ impl SkillService {
 
     pub fn upsert_repo(repo: SkillRepo) -> Result<(), AppError> {
         let _state_guard = skill_state_write_guard();
-        Database::init()?.save_skill_repo(&repo)
+        Database::open_for_skill_publication()?.save_skill_repo(&repo)
     }
 
     pub fn remove_repo(owner: &str, name: &str) -> Result<(), AppError> {
         let _state_guard = skill_state_write_guard();
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         db.delete_skill_repo(owner, name)
     }
 
     pub fn set_repo_enabled(owner: &str, name: &str, enabled: bool) -> Result<bool, AppError> {
         let _state_guard = skill_state_write_guard();
-        Database::init()?.set_skill_repo_enabled(owner, name, enabled)
+        Database::open_for_skill_publication()?.set_skill_repo_enabled(owner, name, enabled)
     }
 
     fn resolve_directory_from_input(index: &SkillsIndex, input: &str) -> Option<String> {
@@ -2993,7 +2993,7 @@ impl SkillService {
         install_name: &str,
         app: &AppType,
     ) -> Result<Option<InstalledSkill>, AppError> {
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         for existing in db.get_all_installed_skills()?.values() {
             if !existing.directory.eq_ignore_ascii_case(install_name) {
                 continue;
@@ -3077,7 +3077,7 @@ impl SkillService {
             Self::remove_from_app(&record.directory, app)?;
         }
 
-        Database::init()?.save_skill(record)?;
+        Database::open_for_skill_publication()?.save_skill(record)?;
         Ok(())
     }
 
@@ -3114,7 +3114,7 @@ impl SkillService {
             }
         }
 
-        Database::init()?.save_skill(record)?;
+        Database::open_for_skill_publication()?.save_skill(record)?;
         Ok(true)
     }
 
@@ -3160,7 +3160,7 @@ impl SkillService {
             }
         }
 
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         let _ = db.delete_skill(&record.id)?;
         Ok(())
     }
@@ -3346,7 +3346,7 @@ impl SkillService {
             updated_at: 0,
         };
 
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         Self::persist_and_sync_new_skill(&db, &installed, app, Self::get_sync_method()?)?;
 
         Ok(installed)
@@ -3591,7 +3591,7 @@ impl SkillService {
             imported.push(skill);
         }
 
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         for repo in &index.repos {
             db.save_skill_repo(repo)?;
         }
