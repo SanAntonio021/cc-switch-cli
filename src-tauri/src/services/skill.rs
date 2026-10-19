@@ -2661,7 +2661,15 @@ impl SkillService {
                         continue;
                     }
                 };
-                let remote_hash = match Self::compute_dir_hash(&remote_dir) {
+                let remote_hash = match if skill
+                    .content_hash
+                    .as_deref()
+                    .is_some_and(|hash| hash.starts_with("local-sha256:"))
+                {
+                    local::local_tree_hash(&remote_dir)
+                } else {
+                    Self::compute_dir_hash(&remote_dir)
+                } {
                     Ok(hash) => hash,
                     Err(error) => {
                         result.failures.push(format!("{}: {error}", skill.id));
@@ -2817,7 +2825,7 @@ impl SkillService {
                 commit,
                 &doc_path.to_string_lossy().replace('\\', "/"),
             ));
-            updated.content_hash = Some(content_hash);
+            updated.content_hash = Some(local::local_tree_hash(&source)?);
             updated.updated_at = Utc::now().timestamp();
             return Self::publish_pinned_update(&db, &source, &current, updated);
         }
@@ -2937,14 +2945,28 @@ impl SkillService {
                 )
             })
         }
+        let baseline = db.capture_pinned_skill_baseline(current)?;
         let ssot_dir = Self::get_ssot_dir()?;
         let ssot = in_place::managed_path(&ssot_dir.join(&current.directory))?;
+        let full_hash = local::local_tree_hash(&ssot)?;
         if let Some(expected) = &current.content_hash {
-            if &Self::compute_dir_hash(&ssot)? != expected {
+            let actual = if expected.starts_with("local-sha256:") {
+                full_hash
+            } else {
+                // Old marketplace hashes omitted dotfiles. Upgrade only when
+                // existing hidden content is unchanged by this publication.
+                Self::require_legacy_hidden_unchanged(&ssot, source)?;
+                Self::compute_dir_hash(&ssot)?
+            };
+            if &actual != expected {
                 return Err(AppError::InvalidInput(
                     "Installed SSOT has local edits; refusing update".into(),
                 ));
             }
+        } else {
+            return Err(AppError::InvalidInput(
+                "Installed SSOT has no content baseline; refusing update".into(),
+            ));
         }
         let mut destinations = vec![ssot.clone()];
         for app in Self::supported_skill_apps().filter(|a| current.apps.is_enabled_for(a)) {
@@ -2994,7 +3016,7 @@ impl SkillService {
                 return Err(abort(prepared, error));
             }
         }
-        if let Err(error) = db.save_skill(&updated) {
+        if let Err(error) = db.save_pinned_skill_if_unchanged(&baseline, &updated) {
             return Err(abort(prepared, error));
         }
         let mut deployment_failures = Vec::new();
@@ -3008,6 +3030,34 @@ impl SkillService {
             skill: updated,
             deployment_failures,
         })
+    }
+
+    fn require_legacy_hidden_unchanged(current: &Path, source: &Path) -> Result<(), AppError> {
+        for entry in fs::read_dir(current).map_err(|e| AppError::io(current, e))? {
+            let entry = entry.map_err(|e| AppError::io(current, e))?;
+            let path = entry.path();
+            let next = source.join(entry.file_name());
+            let kind = entry.file_type().map_err(|e| AppError::io(&path, e))?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                let unchanged = if kind.is_dir() && next.is_dir() {
+                    local::local_tree_hash(&path)? == local::local_tree_hash(&next)?
+                } else if kind.is_file() && next.is_file() {
+                    fs::read(&path).map_err(|e| AppError::io(&path, e))?
+                        == fs::read(&next).map_err(|e| AppError::io(&next, e))?
+                } else {
+                    false
+                };
+                if !unchanged {
+                    return Err(AppError::InvalidInput(format!(
+                        "Legacy SSOT hidden content has no baseline and would change: {}",
+                        path.display()
+                    )));
+                }
+            } else if kind.is_dir() {
+                Self::require_legacy_hidden_unchanged(&path, &next)?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn update_skills(&self, ids: &[String]) -> SkillUpdateBatchResult {
@@ -3242,7 +3292,7 @@ impl SkillService {
         let mut registered = false;
         let result = (|| {
             update.apply()?;
-            installed.content_hash = Some(Self::compute_dir_hash(&dest)?);
+            installed.content_hash = Some(local::local_tree_hash(&dest)?);
             Self::preflight_pi_skill_destination(&dest, &installed.directory, app)?;
             db.save_skill(&installed)?;
             registered = true;
@@ -4232,7 +4282,7 @@ mod tests {
             fs::create_dir_all(dest).unwrap();
             fs::write(dest.join("SKILL.md"), "old skill\n").unwrap();
         }
-        current.content_hash = Some(SkillService::compute_dir_hash(&destinations[0]).unwrap());
+        current.content_hash = Some(local::local_tree_hash(&destinations[0]).unwrap());
         let db = Database::init().unwrap();
         db.save_skill(&current).unwrap();
         let mut updated = current.clone();
@@ -4240,7 +4290,7 @@ mod tests {
             "https://github.com/owner/repo/blob/{}/shared/SKILL.md",
             "b".repeat(40)
         ));
-        updated.content_hash = Some(SkillService::compute_dir_hash(&source).unwrap());
+        updated.content_hash = Some(local::local_tree_hash(&source).unwrap());
         updated.updated_at = 123;
         (db, source, current, updated, destinations)
     }
@@ -4293,6 +4343,42 @@ mod tests {
 
     #[test]
     #[serial(home_settings)]
+    fn pinned_update_rejects_external_disable_or_delete_before_file_changes() {
+        for delete in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+            let (db, source, current, updated, destinations) = pinned_update_fixture(home.path());
+            let peer =
+                rusqlite::Connection::open(crate::database::database_path().unwrap()).unwrap();
+            if delete {
+                peer.execute("DELETE FROM skills WHERE id = ?1", [&current.id])
+                    .unwrap();
+            } else {
+                peer.execute(
+                    "UPDATE skills SET enabled_codex = 0 WHERE id = ?1",
+                    [&current.id],
+                )
+                .unwrap();
+            }
+            assert!(SkillService::publish_pinned_update(&db, &source, &current, updated).is_err());
+            let stored = db.get_installed_skill(&current.id).unwrap();
+            if delete {
+                assert!(stored.is_none());
+            } else {
+                let stored = stored.unwrap();
+                assert!(!stored.apps.codex);
+                assert_eq!(stored.content_hash, current.content_hash);
+            }
+            for dest in &destinations {
+                assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"old skill\n");
+                assert!(!dest.join("references/detail.md").exists());
+                assert_no_pinned_staging(dest.parent().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    #[serial(home_settings)]
     fn pinned_update_preserves_user_app_edits_before_ssot_write() {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
@@ -4313,6 +4399,89 @@ mod tests {
                 .readme_url,
             current.readme_url
         );
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_update_protects_hidden_ssot_edits_without_physical_app_copies() {
+        for change in ["added", "modified", "removed"] {
+            let home = tempfile::tempdir().unwrap();
+            let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+            let (db, source, mut current, mut updated, destinations) =
+                pinned_update_fixture(home.path());
+            current.apps = SkillApps::default();
+            fs::create_dir_all(destinations[0].join(".settings")).unwrap();
+            let hidden = destinations[0].join(".settings/local");
+            fs::write(&hidden, "original").unwrap();
+            current.content_hash = Some(local::local_tree_hash(&destinations[0]).unwrap());
+            db.save_skill(&current).unwrap();
+            updated.apps = current.apps.clone();
+            match change {
+                "added" => fs::write(destinations[0].join(".user-notes"), "keep").unwrap(),
+                "modified" => fs::write(&hidden, "user edit").unwrap(),
+                "removed" => fs::remove_file(&hidden).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = local::local_tree_hash(&destinations[0]).unwrap();
+            let error = SkillService::publish_pinned_update(&db, &source, &current, updated)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("local edits"), "{error}");
+            assert_eq!(before, local::local_tree_hash(&destinations[0]).unwrap());
+            assert_eq!(
+                db.get_installed_skill(&current.id)
+                    .unwrap()
+                    .unwrap()
+                    .content_hash,
+                current.content_hash
+            );
+            assert_no_pinned_staging(destinations[0].parent().unwrap());
+        }
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_update_upgrades_legacy_hash_without_overwriting_unbaselined_dotfiles() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let (db, source, mut current, updated, destinations) = pinned_update_fixture(home.path());
+        for dest in &destinations {
+            fs::write(dest.join(".user-notes"), "keep").unwrap();
+        }
+        current.content_hash = Some(SkillService::compute_dir_hash(&destinations[0]).unwrap());
+        db.save_skill(&current).unwrap();
+        let error = SkillService::publish_pinned_update(&db, &source, &current, updated.clone())
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("hidden content has no baseline"),
+            "{error}"
+        );
+        for dest in &destinations {
+            assert_eq!(fs::read(dest.join(".user-notes")).unwrap(), b"keep");
+            assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"old skill\n");
+        }
+        // Matching hidden bytes can be adopted without changing them, after
+        // which the complete baseline supports normal future hidden updates.
+        fs::write(source.join(".user-notes"), "keep").unwrap();
+        let mut updated = updated;
+        updated.content_hash = Some(local::local_tree_hash(&source).unwrap());
+        SkillService::publish_pinned_update(&db, &source, &current, updated).unwrap();
+        let current = db.get_installed_skill(&current.id).unwrap().unwrap();
+        assert_eq!(
+            current.content_hash,
+            Some(local::local_tree_hash(&source).unwrap())
+        );
+        fs::write(source.join(".user-notes"), "new tracked content").unwrap();
+        let mut updated = current.clone();
+        updated.content_hash = Some(local::local_tree_hash(&source).unwrap());
+        SkillService::publish_pinned_update(&db, &source, &current, updated).unwrap();
+        for dest in &destinations {
+            assert_eq!(
+                fs::read(dest.join(".user-notes")).unwrap(),
+                b"new tracked content"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -4446,7 +4615,7 @@ mod tests {
                     b"new detail\n"
                 );
                 assert_eq!(
-                    SkillService::compute_dir_hash(&root).unwrap(),
+                    local::local_tree_hash(&root).unwrap(),
                     result.content_hash.clone().unwrap()
                 );
             }
