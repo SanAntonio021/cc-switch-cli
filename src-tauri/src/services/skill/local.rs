@@ -76,7 +76,7 @@ fn reject_links(path: &Path) -> Result<(), AppError> {
 
 // Unlike marketplace hashes, private publication includes hidden files and
 // length-frames names/content. All-tree readback must protect user edits too.
-fn local_tree_hash(root: &Path) -> Result<String, AppError> {
+pub(super) fn local_tree_hash(root: &Path) -> Result<String, AppError> {
     use sha2::{Digest, Sha256};
     let root = in_place::managed_path(root)?;
     let root = root.as_path();
