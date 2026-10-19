@@ -672,6 +672,20 @@ impl SkillService {
                         }
                     })?;
                 }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    // Git stores only the executable bit. Match targeted blob
+                    // downloads regardless of the process umask.
+                    let mode = if file.unix_mode().unwrap_or(0o644) & 0o111 != 0 {
+                        0o755
+                    } else {
+                        0o644
+                    };
+                    outfile
+                        .set_permissions(fs::Permissions::from_mode(mode))
+                        .map_err(|e| AppError::io(&outpath, e))?;
+                }
             }
         }
 
@@ -830,6 +844,98 @@ mod archive_capacity_tests {
                 .unwrap();
         }
         zip::ZipArchive::new(std::io::Cursor::new(writer.finish().unwrap().into_inner())).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(home_settings)]
+    async fn archive_capacity_update_check_respects_git_executable_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let owner = "ccswitch-slow-budget-fixture";
+        let source = SkillService::get_ssot_dir().unwrap().join("shared");
+        fs::create_dir_all(&source).unwrap();
+        for (name, bytes, mode) in [
+            ("SKILL.md", "# shared\n", 0o644),
+            ("run.sh", "#!/bin/sh\nexit 0\n", 0o755),
+        ] {
+            fs::write(source.join(name), bytes).unwrap();
+            fs::set_permissions(source.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let db = Database::init().unwrap();
+        db.save_skill(&InstalledSkill {
+            id: format!("{owner}/{port}:shared"),
+            name: "Shared".to_string(),
+            description: None,
+            directory: "shared".to_string(),
+            repo_owner: Some(owner.to_string()),
+            repo_name: Some(port.to_string()),
+            repo_branch: Some("main".to_string()),
+            readme_url: Some(format!(
+                "https://github.com/{owner}/{port}/blob/main/shared/SKILL.md"
+            )),
+            apps: SkillApps::default(),
+            installed_at: 0,
+            content_hash: Some(local::local_tree_hash(&source).unwrap()),
+            updated_at: 0,
+        })
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            for (content, mode) in [
+                ("# shared\n", 0o755),
+                ("# changed\n", 0o755),
+                ("# shared\n", 0o644),
+            ] {
+                let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+                for (name, bytes, permissions) in [
+                    ("SKILL.md", content, 0o644),
+                    ("run.sh", "#!/bin/sh\nexit 0\n", mode),
+                ] {
+                    writer
+                        .start_file(
+                            format!("repo-main/shared/{name}"),
+                            zip::write::SimpleFileOptions::default().unix_permissions(permissions),
+                        )
+                        .unwrap();
+                    writer.write_all(bytes.as_bytes()).unwrap();
+                }
+                let payload = writer.finish().unwrap().into_inner();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept update check: {e}"),
+                    }
+                };
+                read_request(&mut stream);
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                )
+                .unwrap();
+                stream.write_all(&payload).unwrap();
+            }
+        });
+        let service = SkillService::new().unwrap();
+        for expected_updates in [0, 1, 1] {
+            let result = service.check_updates().await.unwrap();
+            assert!(result.failures.is_empty(), "{:?}", result.failures);
+            assert_eq!(result.updates.len(), expected_updates);
+        }
+        server.join().unwrap();
     }
 
     #[test]
