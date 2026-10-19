@@ -321,19 +321,28 @@ mod tests {
     fn proxy_flag_restore_parses_paired_boolean_arguments() {
         for app in ["claude", "codex", "gemini"] {
             let cli = Cli::try_parse_from([
-                "cc-switch", "--app", app, "proxy", "config",
-                "--restore-enabled", "true", "--expected-enabled", "false",
+                "cc-switch",
+                "--app",
+                app,
+                "proxy",
+                "config",
+                "--restore-enabled",
+                "true",
+                "--expected-enabled",
+                "false",
             ])
             .expect("paired restoration arguments should parse");
             assert_eq!(cli.app.expect("selected app").as_str(), app);
             assert!(matches!(
                 cli.command,
-                Some(Commands::Proxy(super::commands::proxy::ProxyCommand::Config {
-                    listen_address: None,
-                    listen_port: None,
-                    restore_enabled: Some(true),
-                    expected_enabled: Some(false),
-                }))
+                Some(Commands::Proxy(
+                    super::commands::proxy::ProxyCommand::Config {
+                        listen_address: None,
+                        listen_port: None,
+                        restore_enabled: Some(true),
+                        expected_enabled: Some(false),
+                    }
+                ))
             ));
         }
     }
@@ -343,8 +352,22 @@ mod tests {
         let invalid_arguments = [
             vec!["--restore-enabled", "true"],
             vec!["--expected-enabled", "false"],
-            vec!["--restore-enabled", "true", "--expected-enabled", "false", "--listen-port", "15722"],
-            vec!["--restore-enabled", "true", "--expected-enabled", "false", "--listen-address", "127.0.0.1"],
+            vec![
+                "--restore-enabled",
+                "true",
+                "--expected-enabled",
+                "false",
+                "--listen-port",
+                "15722",
+            ],
+            vec![
+                "--restore-enabled",
+                "true",
+                "--expected-enabled",
+                "false",
+                "--listen-address",
+                "127.0.0.1",
+            ],
             vec!["--restore-enabled", "yes", "--expected-enabled", "false"],
             vec!["--restore-enabled", "true", "--expected-enabled", "0"],
         ];

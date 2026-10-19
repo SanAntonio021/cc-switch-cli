@@ -168,20 +168,22 @@ impl SkillService {
         &self,
         repo: &SkillRepo,
     ) -> Result<Vec<DiscoverableSkill>, AppError> {
-        let (temp_dir, used_branch) =
-            timeout(std::time::Duration::from_secs(SKILL_REPO_DOWNLOAD_TIMEOUT_SECS), self.download_repo(repo))
-                .await
-                .map_err(|_| {
-                    AppError::Message(format_skill_error(
-                        "DOWNLOAD_TIMEOUT",
-                        &[
-                            ("owner", repo.owner.as_str()),
-                            ("name", repo.name.as_str()),
-                            ("timeout", "660"),
-                        ],
-                        Some("checkNetwork"),
-                    ))
-                })??;
+        let (temp_dir, used_branch) = timeout(
+            std::time::Duration::from_secs(SKILL_REPO_DOWNLOAD_TIMEOUT_SECS),
+            self.download_repo(repo),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Message(format_skill_error(
+                "DOWNLOAD_TIMEOUT",
+                &[
+                    ("owner", repo.owner.as_str()),
+                    ("name", repo.name.as_str()),
+                    ("timeout", "660"),
+                ],
+                Some("checkNetwork"),
+            ))
+        })??;
 
         let mut skills = Vec::new();
         let skill_dirs = Self::scan_skill_dirs(&temp_dir)?;
@@ -455,7 +457,9 @@ impl SkillService {
                 format!("Failed to read download bytes: {e}"),
             )
         })? {
-            Self::check_archive_download_size((bytes.len() as u64).saturating_add(chunk.len() as u64))?;
+            Self::check_archive_download_size(
+                (bytes.len() as u64).saturating_add(chunk.len() as u64),
+            )?;
             bytes.extend_from_slice(&chunk);
         }
 
@@ -797,7 +801,6 @@ impl SkillService {
     }
 }
 
-
 #[cfg(test)]
 mod archive_capacity_tests {
     use super::*;
@@ -805,7 +808,9 @@ mod archive_capacity_tests {
     use std::net::TcpListener;
 
     fn read_request(stream: &mut std::net::TcpStream) {
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
         let mut request = Vec::new();
         let mut buffer = [0_u8; 2048];
         while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -820,7 +825,9 @@ mod archive_capacity_tests {
         let options = zip::write::SimpleFileOptions::default();
         writer.add_directory("repo-main/", options).unwrap();
         for index in 1..entries {
-            writer.add_directory(format!("repo-main/d{index}/"), options).unwrap();
+            writer
+                .add_directory(format!("repo-main/d{index}/"), options)
+                .unwrap();
         }
         zip::ZipArchive::new(std::io::Cursor::new(writer.finish().unwrap().into_inner())).unwrap()
     }
@@ -828,12 +835,18 @@ mod archive_capacity_tests {
     #[test]
     fn archive_capacity_download_size_boundaries() {
         assert_eq!(MAX_SKILL_ARCHIVE_DOWNLOAD_BYTES, 256 * 1024 * 1024);
-        for size in [128 * 1024 * 1024, 129 * 1024 * 1024, MAX_SKILL_ARCHIVE_DOWNLOAD_BYTES] {
+        for size in [
+            128 * 1024 * 1024,
+            129 * 1024 * 1024,
+            MAX_SKILL_ARCHIVE_DOWNLOAD_BYTES,
+        ] {
             SkillService::check_archive_download_size(size).unwrap();
         }
         for size in [MAX_SKILL_ARCHIVE_DOWNLOAD_BYTES + 1, u64::MAX] {
-            assert!(SkillService::check_archive_download_size(size).unwrap_err()
-                .to_string().contains("256 MiB download limit"));
+            assert!(SkillService::check_archive_download_size(size)
+                .unwrap_err()
+                .to_string()
+                .contains("256 MiB download limit"));
         }
     }
 
@@ -848,7 +861,8 @@ mod archive_capacity_tests {
     #[test]
     fn archive_capacity_rejects_more_than_twenty_thousand_entries_before_writes() {
         let dest = tempfile::tempdir().unwrap();
-        let error = SkillService::extract_repo_archive(directory_archive(20_001), dest.path()).unwrap_err();
+        let error =
+            SkillService::extract_repo_archive(directory_archive(20_001), dest.path()).unwrap_err();
         assert!(error.to_string().contains("20001 > 20000"));
         assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
     }
@@ -859,11 +873,14 @@ mod archive_capacity_tests {
         let archive_path = fixture.path().join("large.zip");
         let file = fs::File::create(&archive_path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         writer.add_directory("repo-main/", options).unwrap();
         writer.start_file("repo-main/payload.bin", options).unwrap();
         let chunk = vec![0x5a_u8; 1024 * 1024];
-        for _ in 0..129 { writer.write_all(&chunk).unwrap(); }
+        for _ in 0..129 {
+            writer.write_all(&chunk).unwrap();
+        }
         drop(writer.finish().unwrap());
         let length = fs::metadata(&archive_path).unwrap().len();
         assert!(length > 128 * 1024 * 1024 && length < MAX_SKILL_ARCHIVE_DOWNLOAD_BYTES);
@@ -872,15 +889,27 @@ mod archive_capacity_tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             read_request(&mut stream);
-            stream.set_write_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(30)))
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
             std::io::copy(&mut fs::File::open(archive_path).unwrap(), &mut stream).ok();
         });
         let dest = tempfile::tempdir().unwrap();
-        let result = SkillService::new().unwrap().download_and_extract(&format!("http://{address}/archive.zip"), dest.path()).await;
+        let result = SkillService::new()
+            .unwrap()
+            .download_and_extract(&format!("http://{address}/archive.zip"), dest.path())
+            .await;
         server.join().unwrap();
         result.unwrap();
-        assert_eq!(fs::metadata(dest.path().join("payload.bin")).unwrap().len(), 129 * 1024 * 1024);
+        assert_eq!(
+            fs::metadata(dest.path().join("payload.bin")).unwrap().len(),
+            129 * 1024 * 1024
+        );
     }
 
     #[tokio::test]
@@ -891,10 +920,18 @@ mod archive_capacity_tests {
             let (mut stream, _) = listener.accept().unwrap();
             read_request(&mut stream);
             let length = MAX_SKILL_ARCHIVE_DOWNLOAD_BYTES + 1;
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
         let dest = tempfile::tempdir().unwrap();
-        let error = SkillService::new().unwrap().download_and_extract(&format!("http://{address}/archive.zip"), dest.path()).await.unwrap_err();
+        let error = SkillService::new()
+            .unwrap()
+            .download_and_extract(&format!("http://{address}/archive.zip"), dest.path())
+            .await
+            .unwrap_err();
         server.join().unwrap();
         assert!(error.to_string().contains("256 MiB download limit"));
         assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
@@ -907,15 +944,23 @@ mod archive_capacity_tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             read_request(&mut stream);
-            stream.set_write_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(30)))
+                .unwrap();
             write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").unwrap();
             let chunk = vec![0_u8; 1024 * 1024];
             for _ in 0..257 {
-                if stream.write_all(&chunk).is_err() { break; }
+                if stream.write_all(&chunk).is_err() {
+                    break;
+                }
             }
         });
         let dest = tempfile::tempdir().unwrap();
-        let error = SkillService::new().unwrap().download_and_extract(&format!("http://{address}/archive.zip"), dest.path()).await.unwrap_err();
+        let error = SkillService::new()
+            .unwrap()
+            .download_and_extract(&format!("http://{address}/archive.zip"), dest.path())
+            .await
+            .unwrap_err();
         server.join().unwrap();
         assert!(error.to_string().contains("256 MiB download limit"));
         assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
@@ -941,7 +986,9 @@ mod large_archive_timeout_tests {
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             let mut buffer = [0_u8; 2048];
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -949,7 +996,12 @@ mod large_archive_timeout_tests {
                 assert!(count > 0 && request.len() < 16384);
                 request.extend_from_slice(&buffer[..count]);
             }
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len()).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            )
+            .unwrap();
             let split = payload.len() / 2;
             stream.write_all(&payload[..split]).unwrap();
             stream.flush().unwrap();
@@ -967,14 +1019,20 @@ mod large_archive_timeout_tests {
         let result = timeout(
             std::time::Duration::from_secs(SKILL_REPO_DOWNLOAD_TIMEOUT_SECS),
             service.download_repo_for_update(&repo),
-        ).await;
+        )
+        .await;
         let elapsed = started.elapsed().as_secs();
         println!("[slow-fixture] elapsed_seconds={elapsed}");
         server.join().unwrap();
-        assert!(matches!(&result, Ok(Ok(_))), "repository request failed after {elapsed}s: {result:?}");
+        assert!(
+            matches!(&result, Ok(Ok(_))),
+            "repository request failed after {elapsed}s: {result:?}"
+        );
         let (path, branch) = result.unwrap().unwrap();
         let downloaded = DownloadedRepoGuard::new(path);
         assert_eq!(branch, "main");
-        assert!(fs::read_to_string(downloaded.path().join("SKILL.md")).unwrap().contains("name: slow-fixture"));
+        assert!(fs::read_to_string(downloaded.path().join("SKILL.md"))
+            .unwrap()
+            .contains("name: slow-fixture"));
     }
 }

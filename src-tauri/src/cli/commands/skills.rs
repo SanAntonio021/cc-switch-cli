@@ -15,17 +15,25 @@ use crate::services::SkillService;
 pub enum SkillsCommand {
     /// Install/update a provenance-bound local directory (offline, managed only).
     InstallLocal {
-        #[arg(long)] source_dir: std::path::PathBuf,
-        #[arg(long)] name: String,
-        #[arg(long)] source_repo: String,
-        #[arg(long)] source_path: String,
-        #[arg(long)] source_commit: String,
-        #[arg(long)] json: bool,
+        #[arg(long)]
+        source_dir: std::path::PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        source_repo: String,
+        #[arg(long)]
+        source_path: String,
+        #[arg(long)]
+        source_commit: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Read one installed record without migrating or creating the database.
     LocalInfo {
-        #[arg(long)] name: String,
-        #[arg(long)] json: bool,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        json: bool,
     },
     /// List installed skills (from SSOT + database state)
     List,
@@ -172,13 +180,29 @@ pub fn execute(cmd: SkillsCommand, app: Option<AppType>) -> Result<(), AppError>
     let app_type = app.clone().unwrap_or(AppType::Claude);
 
     match cmd {
-        SkillsCommand::InstallLocal { source_dir, name, source_repo, source_path, source_commit, json: _ } => {
-            let result = SkillService::install_local(&source_dir, &name, &source_repo, &source_path, &source_commit, &app.clone().unwrap_or(AppType::Codex))?;
-            println!("{}", result); Ok(())
-        },
+        SkillsCommand::InstallLocal {
+            source_dir,
+            name,
+            source_repo,
+            source_path,
+            source_commit,
+            json: _,
+        } => {
+            let result = SkillService::install_local(
+                &source_dir,
+                &name,
+                &source_repo,
+                &source_path,
+                &source_commit,
+                &app.clone().unwrap_or(AppType::Codex),
+            )?;
+            println!("{}", result);
+            Ok(())
+        }
         SkillsCommand::LocalInfo { name, json: _ } => {
-            println!("{}", SkillService::local_info(&name)?); Ok(())
-        },
+            println!("{}", SkillService::local_info(&name)?);
+            Ok(())
+        }
         SkillsCommand::List => list_installed(),
         SkillsCommand::Discover { query } => discover_skills(query.as_deref()),
         SkillsCommand::Market {
@@ -186,9 +210,16 @@ pub fn execute(cmd: SkillsCommand, app: Option<AppType>) -> Result<(), AppError>
             limit,
             offset,
         } => search_market(&query, limit, offset),
-        SkillsCommand::Install { spec, source_commit } => install_skill(&app_type, &spec, source_commit.as_deref()),
+        SkillsCommand::Install {
+            spec,
+            source_commit,
+        } => install_skill(&app_type, &spec, source_commit.as_deref()),
         SkillsCommand::CheckUpdates => check_skill_updates(),
-        SkillsCommand::Update { spec, all, source_commit } => update_skills(spec.as_deref(), all, source_commit.as_deref()),
+        SkillsCommand::Update {
+            spec,
+            all,
+            source_commit,
+        } => update_skills(spec.as_deref(), all, source_commit.as_deref()),
         SkillsCommand::Uninstall { spec } => uninstall_skill(&spec),
         SkillsCommand::Enable { spec, apps } => toggle_skill(&app_type, &spec, &apps, true),
         SkillsCommand::Disable { spec, apps } => toggle_skill(&app_type, &spec, &apps, false),
@@ -317,7 +348,11 @@ fn discover_skills(query: Option<&str>) -> Result<(), AppError> {
     Ok(())
 }
 
-fn install_skill(app_type: &AppType, spec: &str, source_commit: Option<&str>) -> Result<(), AppError> {
+fn install_skill(
+    app_type: &AppType,
+    spec: &str,
+    source_commit: Option<&str>,
+) -> Result<(), AppError> {
     ensure_supported_skills_app(app_type, "install")?;
     let service = SkillService::new()?;
     let installed = run_async(service.install_at_commit(spec, app_type, source_commit))?;
@@ -359,7 +394,11 @@ fn check_skill_updates() -> Result<(), AppError> {
     }
 }
 
-fn update_skills(spec: Option<&str>, all: bool, source_commit: Option<&str>) -> Result<(), AppError> {
+fn update_skills(
+    spec: Option<&str>,
+    all: bool,
+    source_commit: Option<&str>,
+) -> Result<(), AppError> {
     let service = SkillService::new()?;
     let mut check_failures = Vec::new();
     let ids = if all {
@@ -395,7 +434,8 @@ fn update_skills(spec: Option<&str>, all: bool, source_commit: Option<&str>) -> 
         )));
     }
 
-    let batch = run_async(async { Ok(service.update_skills_at_commit(&ids, source_commit).await) })?;
+    let batch =
+        run_async(async { Ok(service.update_skills_at_commit(&ids, source_commit).await) })?;
     if !batch.updated.is_empty() {
         println!(
             "{}",
