@@ -483,6 +483,29 @@ impl Database {
         Self::init_impl(true)
     }
 
+    /// Skill publication must not normalize unrelated state in a current-schema DB.
+    /// New and older databases still follow the upstream initialization/migration path.
+    pub fn open_for_skill_publication() -> Result<Self, AppError> {
+        crate::config::validate_config_dir()?;
+        let db_path = database_path()?;
+        if db_path.exists() {
+            #[cfg(unix)]
+            validate_existing_database_file(&db_path)?;
+            let conn = Connection::open_with_flags(&db_path, readonly_database_open_flags())
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            conn.busy_timeout(Duration::from_secs(5))
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let version = Self::get_user_version(&conn)?;
+            if version > SCHEMA_VERSION {
+                return Err(Self::future_schema_error(version));
+            }
+            if version == SCHEMA_VERSION {
+                return Self::open_existing_current_schema();
+            }
+        }
+        Self::init()
+    }
+
     /// Daemon startup already owns `daemon.pid`; the type-level lease proves
     /// there cannot be an older daemon to quiesce before this initialization.
     #[cfg(unix)]

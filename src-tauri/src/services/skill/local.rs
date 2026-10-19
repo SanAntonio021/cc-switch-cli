@@ -78,6 +78,8 @@ fn reject_links(path: &Path) -> Result<(), AppError> {
 // length-frames names/content. All-tree readback must protect user edits too.
 fn local_tree_hash(root: &Path) -> Result<String, AppError> {
     use sha2::{Digest, Sha256};
+    let root = in_place::managed_path(root)?;
+    let root = root.as_path();
     fn collect(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), AppError> {
         for entry in fs::read_dir(root).map_err(|e| AppError::io(root, e))? {
             let path = entry.map_err(|e| AppError::io(root, e))?.path();
@@ -107,6 +109,32 @@ fn local_tree_hash(root: &Path) -> Result<String, AppError> {
         digest.update(bytes);
     }
     Ok(format!("local-sha256:{:x}", digest.finalize()))
+}
+
+// Rollback preserves directories. A failed first install may therefore leave
+// an unmanaged tree containing only directories, which is safe to reuse.
+fn require_file_empty_target(path: &Path, conflict: &str) -> Result<(), AppError> {
+    let path = in_place::managed_path(path)?;
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::io(&path, e)),
+        Ok(_) => {}
+    }
+    reject_links(&path)?;
+    fn check_dirs(path: &Path, conflict: &str) -> Result<(), AppError> {
+        for entry in fs::read_dir(path).map_err(|e| AppError::io(path, e))? {
+            let entry = entry.map_err(|e| AppError::io(path, e))?;
+            let kind = entry
+                .file_type()
+                .map_err(|e| AppError::io(entry.path(), e))?;
+            if !kind.is_dir() {
+                return Err(invalid(conflict));
+            }
+            check_dirs(&entry.path(), conflict)?;
+        }
+        Ok(())
+    }
+    check_dirs(&path, conflict)
 }
 
 fn abort_updates(mut updates: Vec<in_place::Update>, cause: AppError) -> AppError {
@@ -203,7 +231,7 @@ impl SkillService {
             ));
         }
         let _guard = skill_state_write_guard();
-        let db = Database::init()?;
+        let db = Database::open_for_skill_publication()?;
         let baseline = db.capture_local_skill_baseline(name)?;
         let mut existing = baseline.skill.clone();
         if let Some(record) = existing.as_mut() {
@@ -236,8 +264,8 @@ impl SkillService {
                 return Err(invalid("Runtime skill directories cannot be local sources"));
             }
         }
-        if existing.is_none() && fs::symlink_metadata(&ssot).is_ok() {
-            return Err(invalid("Unmanaged SSOT directory conflict"));
+        if existing.is_none() {
+            require_file_empty_target(&ssot, "Unmanaged SSOT directory conflict")?;
         }
         if let Some(old) = &existing {
             if old.content_hash.as_deref() != Some(local_tree_hash(&ssot)?.as_str()) {
@@ -259,15 +287,16 @@ impl SkillService {
                 }
                 return Err(invalid("Foreign application link conflict"));
             }
-            if dest.exists() {
-                let Some(old) = &existing else {
-                    return Err(invalid("Unmanaged application directory conflict"));
-                };
-                if old.content_hash.as_deref() != Some(local_tree_hash(&dest)?.as_str()) {
-                    return Err(invalid(
-                        "Application skill has local edits; refusing update",
-                    ));
+            if let Some(old) = &existing {
+                if dest.exists() {
+                    if old.content_hash.as_deref() != Some(local_tree_hash(&dest)?.as_str()) {
+                        return Err(invalid(
+                            "Application skill has local edits; refusing update",
+                        ));
+                    }
                 }
+            } else {
+                require_file_empty_target(&dest, "Unmanaged application directory conflict")?;
             }
             destinations.push(dest);
         }
@@ -367,6 +396,194 @@ mod tests {
             &AppType::Codex,
         )
     }
+    #[test]
+    fn local_schema20_publication_preserves_proxy_flags_on_success_and_rejection() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let input = source(home.path(), "first");
+        let db = Database::init().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            assert_eq!(Database::get_user_version(&conn).unwrap(), 20);
+            assert!(
+                conn.execute(
+                    "UPDATE proxy_config SET enabled=0, auto_failover_enabled=1",
+                    [],
+                )
+                .unwrap()
+                    > 0
+            );
+        }
+        let proxy_flags = || {
+            let conn = db.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT app_type,enabled,auto_failover_enabled FROM proxy_config ORDER BY app_type")
+                .unwrap();
+            let flags = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            flags
+        };
+        let before = proxy_flags();
+        assert_eq!(install(&input, 'a').unwrap()["action"], "installed");
+        assert_eq!(proxy_flags(), before);
+        source(home.path(), "second");
+        // Rejection after file deployment must also avoid startup normalization.
+        let error = SkillService::install_local_checked(
+            &input,
+            "demo",
+            "owner/private",
+            "private-skills/demo",
+            &"b".repeat(40),
+            &AppType::Codex,
+            |_| Err(invalid("injected publication rejection")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("rollback verified"));
+        assert_eq!(proxy_flags(), before);
+        // A preflight source conflict must preserve the same flags too.
+        assert!(SkillService::install_local(
+            &input,
+            "demo",
+            "other/repo",
+            "private-skills/demo",
+            &"b".repeat(40),
+            &AppType::Codex,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Foreign"));
+        assert_eq!(proxy_flags(), before);
+    }
+
+    #[test]
+    fn local_install_retains_upstream_old_schema_migration() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let input = source(home.path(), "first");
+        {
+            let db = Database::init().unwrap();
+            let conn = db.conn.lock().unwrap();
+            Database::set_user_version(&conn, 19).unwrap();
+        }
+        assert_eq!(install(&input, 'a').unwrap()["action"], "installed");
+        let db = Database::open_existing_current_schema().unwrap();
+        assert_eq!(
+            Database::get_user_version(&db.conn.lock().unwrap()).unwrap(),
+            20
+        );
+    }
+
+    #[test]
+    fn local_failed_first_install_retries_with_file_empty_trees() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let input = source(home.path(), "first");
+        fs::create_dir_all(input.join("nested")).unwrap();
+        fs::write(input.join("nested/data.bin"), [0, 255]).unwrap();
+        let error = SkillService::install_local_checked(
+            &input,
+            "demo",
+            "owner/private",
+            "private-skills/demo",
+            &"a".repeat(40),
+            &AppType::Codex,
+            |_| Err(invalid("injected first publication failure")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("rollback verified"));
+        assert_eq!(SkillService::local_info("demo").unwrap()["found"], false);
+        let targets = [
+            SkillService::get_ssot_dir().unwrap().join("demo"),
+            SkillService::get_app_skills_dir(&AppType::Codex)
+                .unwrap()
+                .join("demo"),
+        ];
+        for target in &targets {
+            assert!(target.join("nested").is_dir());
+            assert!(!target.join("SKILL.md").exists());
+            assert!(!target.join("nested/data.bin").exists());
+        }
+        assert_eq!(install(&input, 'a').unwrap()["action"], "installed");
+        for target in &targets {
+            assert_eq!(
+                fs::read(target.join("SKILL.md")).unwrap(),
+                fs::read(input.join("SKILL.md")).unwrap()
+            );
+            assert_eq!(fs::read(target.join("nested/data.bin")).unwrap(), [0, 255]);
+        }
+    }
+
+    #[test]
+    fn local_install_rejects_unmanaged_trees_with_even_empty_files() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let input = source(home.path(), "first");
+        for target in [
+            SkillService::get_ssot_dir().unwrap().join("demo"),
+            SkillService::get_app_skills_dir(&AppType::Codex)
+                .unwrap()
+                .join("demo"),
+        ] {
+            fs::create_dir_all(target.join("nested")).unwrap();
+            let file = target.join("nested/.keep");
+            fs::write(&file, b"").unwrap();
+            assert!(install(&input, 'a')
+                .unwrap_err()
+                .to_string()
+                .contains("Unmanaged"));
+            assert_eq!(fs::read(&file).unwrap(), Vec::<u8>::new());
+            assert_eq!(SkillService::local_info("demo").unwrap()["found"], false);
+            fs::remove_file(file).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_empty_target_rejects_links_and_nonregular_nodes() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let target = SkillService::get_ssot_dir().unwrap().join("demo");
+        let empty = home.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        symlink(&empty, target.join("link")).unwrap();
+        assert!(require_file_empty_target(&target, "conflict").is_err());
+        fs::remove_file(target.join("link")).unwrap();
+        let _socket = UnixListener::bind(target.join("socket")).unwrap();
+        assert!(require_file_empty_target(&target, "conflict").is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn local_empty_target_rejects_junctions() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let target = SkillService::get_ssot_dir().unwrap().join("demo");
+        let empty = home.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let linked = target.join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&linked)
+            .arg(&empty)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "junction fixture failed");
+        assert!(require_file_empty_target(&target, "conflict").is_err());
+        fs::remove_dir(&linked).unwrap();
+    }
+
     #[test]
     fn local_install_updates_pi_copy_and_preserves_user_edits() {
         let home = tempfile::tempdir().unwrap();
