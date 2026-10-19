@@ -5,6 +5,9 @@
 //! - 数据库存储安装记录、启用状态与仓库列表（`~/.cc-switch/cc-switch.db`）
 
 mod discovery;
+mod targeted;
+mod in_place;
+mod local;
 
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -24,11 +27,13 @@ use crate::config::{create_managed_config_dir_all, get_app_config_dir, write_jso
 use crate::database::Database;
 use crate::error::{format_skill_error, AppError};
 
+// Shared by discovery, update checks, updates, and installation.
+const SKILL_REPO_DOWNLOAD_TIMEOUT_SECS: u64 = 660;
 const SKILLS_INDEX_VERSION: u32 = 1;
 const SKILLS_DISCOVER_CACHE_VERSION: u32 = 2;
-const MAX_SKILL_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_SKILL_ARCHIVE_ENTRIES: usize = 20_000;
 const MAX_SKILL_ARCHIVE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_SKILL_ARCHIVE_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SKILL_ARCHIVE_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SKILL_ARCHIVE_PATH_DEPTH: usize = 64;
 const SKILL_ARCHIVE_ENTRY_COST: u64 = 4096;
 const STORAGE_MIGRATION_JOURNAL_FILE: &str = "skill-storage-migration.json";
@@ -1281,6 +1286,15 @@ impl SkillService {
             Self::inspect_pi_skill_destination(&source, &dest)?;
         }
 
+        // Enabling an already linked skill must not unlink it and then fall
+        // back to a physical copy if link-creation privileges have changed.
+        if matches!(method, SyncMethod::Auto | SyncMethod::Symlink)
+            && Self::is_symlink(&dest)
+            && fs::canonicalize(&dest).ok() == fs::canonicalize(&source).ok()
+        {
+            return Ok(());
+        }
+
         match method {
             SyncMethod::Auto => {
                 if dest.exists() && !Self::is_symlink(&dest) {
@@ -1333,6 +1347,15 @@ impl SkillService {
 
     fn replace_dest_with_copy(source: &Path, dest: &Path, directory: &str) -> Result<(), AppError> {
         Self::validate_sync_source_dir(source, directory)?;
+
+        // Keep watched directory objects intact. Explicit conversion of a link
+        // to a copy still follows the existing link replacement path below.
+        if !Self::is_symlink(dest) {
+            let mut update = in_place::Update::prepare(source, dest)?;
+            update.apply()?;
+            update.commit()?;
+            return Ok(());
+        }
 
         let parent = dest.parent().ok_or_else(|| {
             AppError::InvalidInput(format!("Invalid Skill destination: {}", dest.display()))
@@ -1445,6 +1468,21 @@ impl SkillService {
         }
         if source == dest {
             return Ok(());
+        }
+
+        // Auto preserves an existing link to this SSOT; the updated target is
+        // already visible through it. Do not convert a link into a directory.
+        if matches!(method, SyncMethod::Auto | SyncMethod::Symlink)
+            && Self::is_symlink(&dest)
+            && fs::canonicalize(&dest).ok() == fs::canonicalize(&source).ok()
+        {
+            return Ok(());
+        }
+        if !Self::is_symlink(&dest)
+            && (matches!(method, SyncMethod::Copy)
+                || (matches!(method, SyncMethod::Auto) && dest.is_dir()))
+        {
+            return Self::replace_dest_with_copy(&source, &dest, &directory);
         }
 
         let staging = tempfile::Builder::new()
@@ -2571,7 +2609,7 @@ impl SkillService {
                 enabled: true,
             };
             let (temp_dir, used_branch) = match timeout(
-                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(SKILL_REPO_DOWNLOAD_TIMEOUT_SECS),
                 self.download_repo_for_update(&repo),
             )
             .await
@@ -2662,21 +2700,9 @@ impl SkillService {
         Ok(result)
     }
 
-    fn restore_previous_update(dest: &Path, previous: Option<&Path>) -> Result<(), AppError> {
-        if fs::symlink_metadata(dest).is_ok() {
-            Self::remove_path(dest)?;
-        }
-        if let Some(previous) = previous {
-            fs::rename(previous, dest).map_err(|e| AppError::IoContext {
-                context: format!("Failed to restore Skill directory: {}", dest.display()),
-                source: e,
-            })?;
-        }
-        Ok(())
-    }
-
     /// Update one repository-backed Skill after an explicit user action.
-    async fn update_skill(&self, skill_id: &str) -> Result<SkillUpdateOutcome, AppError> {
+    async fn update_skill(&self, skill_id: &str, source_commit: Option<&str>) -> Result<SkillUpdateOutcome, AppError> {
+        if let Some(commit) = source_commit { Self::validate_source_commit(commit)?; }
         let db = Database::init()?;
         let mut skill = db
             .get_installed_skill(skill_id)?
@@ -2702,9 +2728,21 @@ impl SkillService {
             enabled: true,
         };
 
+        let targeted_source = if source_commit.is_some() {
+            Some(Self::source_path_from_readme(&skill, None).ok_or_else(||
+                AppError::InvalidInput("Pinned update requires an exact GitHub source path in readme_url".into()))?)
+        } else { None };
+        let download = async {
+            if let Some(commit) = source_commit {
+                let path = self.download_targeted_skill(&repo, commit, targeted_source.as_deref().unwrap()).await?;
+                Ok((path, repo.branch.clone()))
+            } else {
+                self.download_repo_for_update(&repo).await
+            }
+        };
         let (temp_dir, used_branch) = timeout(
-            std::time::Duration::from_secs(60),
-            self.download_repo_for_update(&repo),
+            std::time::Duration::from_secs(SKILL_REPO_DOWNLOAD_TIMEOUT_SECS),
+            download,
         )
         .await
         .map_err(|_| {
@@ -2741,14 +2779,6 @@ impl SkillService {
             )));
         }
         let ssot_dir = Self::get_ssot_dir()?;
-        let staging = tempfile::Builder::new()
-            .prefix(".cc-switch-skill-update-")
-            .tempdir_in(&ssot_dir)
-            .map_err(|e| AppError::io(&ssot_dir, e))?;
-        let next = staging.path().join("next");
-        let previous = staging.path().join("previous");
-        Self::copy_dir_recursive(&source, &next)?;
-        drop(temp_dir);
         let sync_method = Self::get_sync_method()?;
         let dest = ssot_dir.join(&directory);
         let pi_deployment = if current.apps.pi {
@@ -2757,25 +2787,9 @@ impl SkillService {
         } else {
             None
         };
-        let had_previous = fs::symlink_metadata(&dest).is_ok();
-        if had_previous {
-            fs::rename(&dest, &previous).map_err(|e| AppError::IoContext {
-                context: format!("Failed to stage existing Skill: {}", dest.display()),
-                source: e,
-            })?;
-        }
-        if let Err(error) = fs::rename(&next, &dest) {
-            if had_previous {
-                if let Err(rollback) = fs::rename(&previous, &dest) {
-                    let preserved = staging.keep();
-                    return Err(AppError::Message(format!(
-                        "Skill update failed ({error}); rollback failed ({rollback}). Previous files remain at {}",
-                        preserved.join("previous").display()
-                    )));
-                }
-            }
-            return Err(AppError::io(&dest, error));
-        }
+        let mut file_update = in_place::Update::prepare(&source, &dest)?;
+        drop(temp_dir);
+        file_update.apply()?;
 
         // Preserve app enablement changes made while the repository was downloading.
         let mut updated = current;
@@ -2800,20 +2814,25 @@ impl SkillService {
         updated.updated_at = Utc::now().timestamp();
 
         if let Err(error) = db.save_skill(&updated) {
-            if let Err(rollback) =
-                Self::restore_previous_update(&dest, had_previous.then_some(previous.as_path()))
-            {
-                let preserved = staging.keep();
+            if let Err(rollback) = file_update.rollback() {
                 return Err(AppError::Message(format!(
-                    "Skill metadata update failed ({error}); rollback failed ({rollback}). Previous files remain at {}",
-                    preserved.join("previous").display()
+                    "Skill metadata update failed ({error}); rollback failed ({rollback})"
+                )));
+            }
+            if let Err(cleanup) = file_update.commit() {
+                return Err(AppError::Message(format!(
+                    "Skill metadata update failed ({error}); rollback verified; cleanup failed ({cleanup})"
                 )));
             }
             return Err(error);
         }
-        drop(staging);
-
         let mut deployment_failures = Vec::new();
+        if let Err(error) = file_update.commit() {
+            // SSOT and DB are committed. Still refresh app copies; a cleanup
+            // failure must not leave them stale just because a backup is locked.
+            log::warn!("Skill update staging cleanup failed: {error}");
+            deployment_failures.push(format!("Staging cleanup: {error}"));
+        }
         if let Some(deployment) = pi_deployment.as_ref() {
             let pi_destination = Self::get_app_skills_dir(&AppType::Pi)?.join(&updated.directory);
             if let Err(error) =
@@ -2850,13 +2869,17 @@ impl SkillService {
     }
 
     pub async fn update_skills(&self, ids: &[String]) -> SkillUpdateBatchResult {
+        self.update_skills_at_commit(ids, None).await
+    }
+
+    pub async fn update_skills_at_commit(&self, ids: &[String], source_commit: Option<&str>) -> SkillUpdateBatchResult {
         let mut result = SkillUpdateBatchResult::default();
         let mut seen = HashSet::new();
         for id in ids {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            match self.update_skill(id).await {
+            match self.update_skill(id, source_commit).await {
                 Ok(outcome) => {
                     if !outcome.deployment_failures.is_empty() {
                         result.failures.push(SkillUpdateFailure {
@@ -3126,6 +3149,11 @@ impl SkillService {
     }
 
     pub async fn install(&self, spec: &str, app: &AppType) -> Result<InstalledSkill, AppError> {
+        self.install_at_commit(spec, app, None).await
+    }
+
+    pub async fn install_at_commit(&self, spec: &str, app: &AppType, source_commit: Option<&str>) -> Result<InstalledSkill, AppError> {
+        if let Some(commit) = source_commit { Self::validate_source_commit(commit)?; }
         let spec = spec.trim();
         if spec.is_empty() {
             return Err(AppError::InvalidInput("Skill 不能为空".to_string()));
@@ -3135,7 +3163,10 @@ impl SkillService {
         let _ = Self::migrate_ssot_if_pending(&mut index)?;
 
         // Resolve spec to a discoverable skill.
-        let discoverable = self.resolve_install_spec(&index, spec).await?;
+        let discoverable = if source_commit.is_some() {
+            discoverable_from_repo_spec(spec).ok_or_else(|| AppError::InvalidInput(
+                "Pinned install requires owner/repo:exact/source/path".into()))?
+        } else { self.resolve_install_spec(&index, spec).await? };
 
         // Repository sources may be nested, but the installed directory is one safe segment.
         let source_rel =
@@ -3158,6 +3189,7 @@ impl SkillService {
         let new_repo = format!("{}/{}", discoverable.repo_owner, discoverable.repo_name);
         let needs_download = {
             let _state_guard = skill_state_write_guard();
+            if source_commit.is_some() { Self::reject_pinned_existing_install(&install_name)?; }
             if let Some(existing) = Self::reuse_existing_install(&discoverable, &install_name, app)?
             {
                 return Ok(existing);
@@ -3179,8 +3211,13 @@ impl SkillService {
             };
 
             let (temp_dir, used_branch) = timeout(
-                std::time::Duration::from_secs(60),
-                self.download_repo(&repo),
+                std::time::Duration::from_secs(SKILL_REPO_DOWNLOAD_TIMEOUT_SECS),
+                async {
+                    if let Some(commit) = source_commit {
+                        let path = self.download_targeted_skill(&repo, commit, &source_rel).await?;
+                        Ok((path, repo.branch.clone()))
+                    } else { self.download_repo(&repo).await }
+                },
             )
             .await
             .map_err(|_| {
@@ -3189,7 +3226,7 @@ impl SkillService {
                     &[
                         ("owner", repo.owner.as_str()),
                         ("name", repo.name.as_str()),
-                        ("timeout", "60"),
+                        ("timeout", "660"),
                     ],
                     Some("checkNetwork"),
                 ))
@@ -3236,6 +3273,7 @@ impl SkillService {
         // Network I/O is complete. Re-check under the write guard before any
         // SSOT or database mutation, then keep the projection consistent.
         let _state_guard = skill_state_write_guard();
+        if source_commit.is_some() { Self::reject_pinned_existing_install(&install_name)?; }
         if let Some(existing) = Self::reuse_existing_install(&discoverable, &install_name, app)? {
             return Ok(existing);
         }
@@ -4174,6 +4212,58 @@ mod tests {
             SkillService::branch_candidates("HEAD", Some("trunk".to_string()), false),
             vec!["trunk", "main", "master"]
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn in_place_valid_app_link_survives_enable_and_update() {
+        use std::os::windows::fs::{symlink_dir, OpenOptionsExt};
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let ssot = SkillService::get_ssot_dir().unwrap().join("demo");
+        let dest = SkillService::get_app_skills_dir(&AppType::Codex).unwrap().join("demo");
+        fs::create_dir_all(&ssot).unwrap();
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(ssot.join("SKILL.md"), "new").unwrap();
+        match symlink_dir(&ssot, &dest) {
+            Ok(()) => {},
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!("app link test unavailable: Windows symlink privilege not granted");
+                return;
+            },
+            Err(e) => panic!("create app link: {e}"),
+        }
+        let _link = fs::OpenOptions::new().read(true).share_mode(3)
+            .custom_flags(0x02200000).open(&dest).unwrap();
+        SkillService::sync_to_app_dir("demo", &AppType::Codex, SyncMethod::Auto).unwrap();
+        SkillService::sync_updated_skill_to_app("demo", &AppType::Codex, SyncMethod::Auto).unwrap();
+        assert!(SkillService::is_symlink(&dest));
+        assert_eq!(fs::canonicalize(&dest).unwrap(), fs::canonicalize(&ssot).unwrap());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn in_place_app_deployment_preserves_watched_directories() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let ssot = SkillService::get_ssot_dir().unwrap().join("demo");
+        let dest = SkillService::get_app_skills_dir(&AppType::Codex).unwrap().join("demo");
+        fs::create_dir_all(ssot.join("references")).unwrap();
+        fs::create_dir_all(dest.join("references")).unwrap();
+        fs::write(ssot.join("SKILL.md"), "new").unwrap();
+        fs::write(ssot.join("references/new.md"), "added").unwrap();
+        fs::write(dest.join("SKILL.md"), "old").unwrap();
+        fs::write(dest.join("references/old.md"), "removed").unwrap();
+        let _watch = fs::OpenOptions::new().read(true).share_mode(3)
+            .custom_flags(0x02000000).open(dest.join("references")).unwrap();
+        assert!(fs::rename(&dest, dest.with_extension("moved")).is_err());
+        SkillService::sync_updated_skill_to_app("demo", &AppType::Codex, SyncMethod::Copy).unwrap();
+        SkillService::sync_to_app_dir("demo", &AppType::Codex, SyncMethod::Auto).unwrap();
+        assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"new");
+        assert!(dest.join("references/new.md").is_file());
+        assert!(!dest.join("references/old.md").exists());
+        assert!(!SkillService::is_symlink(&dest));
     }
 
     #[test]

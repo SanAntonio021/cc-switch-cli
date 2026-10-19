@@ -88,6 +88,23 @@ fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 fn command_requires_startup_state(command: &Option<Commands>) -> bool {
+    if matches!(
+        command,
+        Some(Commands::Proxy(
+            cc_switch_lib::cli::commands::proxy::ProxyCommand::Config {
+                listen_address: None,
+                listen_port: None,
+                restore_enabled: Some(_),
+                expected_enabled: Some(_),
+            }
+        ))
+    ) {
+        return false;
+    }
+    if matches!(command, Some(Commands::Skills(
+        cc_switch_lib::cli::commands::skills::SkillsCommand::InstallLocal { .. }
+        | cc_switch_lib::cli::commands::skills::SkillsCommand::LocalInfo { .. }
+    ))) { return false; }
     #[cfg(unix)]
     if std::env::var_os(cc_switch_lib::daemon::supervisor::DAEMON_SOCKET_ENV).is_some() {
         return false;
@@ -99,6 +116,8 @@ fn command_requires_startup_state(command: &Option<Commands>) -> bool {
         | Some(Commands::Update(_))
         | Some(Commands::Internal(_))
         | Some(Commands::Sessions(_))
+        | Some(Commands::Skills(_))
+        | Some(Commands::Config(cc_switch_lib::cli::commands::config::ConfigCommand::Backup { .. }))
         | Some(Commands::Settings(
             cc_switch_lib::cli::commands::settings::SettingsCommand::CodexAuthPreservation(_),
         )) => false,
@@ -181,6 +200,49 @@ mod tests {
         let cli = Cli::parse_from(["cc-switch", "daemon", "start"]);
 
         assert!(command_uses_own_logger(&cli.command));
+    }
+
+    #[test]
+    fn proxy_flag_restore_skips_startup_state_only_for_exact_restore_config() {
+        let restore = Cli::try_parse_from([
+            "cc-switch", "--app", "codex", "proxy", "config",
+            "--restore-enabled", "true", "--expected-enabled", "false",
+        ])
+        .expect("parse restoration command");
+        assert!(!command_requires_startup_state(&restore.command));
+        assert!(database_access_required(&restore.command));
+        for command in [
+            vec!["cc-switch", "proxy", "config"],
+            vec!["cc-switch", "proxy", "config", "--listen-port", "15722"],
+            vec!["cc-switch", "proxy", "config", "--listen-address", "localhost"],
+            vec!["cc-switch", "proxy", "enable"],
+            vec!["cc-switch", "proxy", "disable"],
+            vec!["cc-switch", "proxy", "serve"],
+            vec!["cc-switch", "proxy", "show"],
+        ] {
+            let cli = Cli::try_parse_from(command).expect("parse ordinary proxy command");
+            assert!(command_requires_startup_state(&cli.command));
+        }
+        // Programmatically constructed partial or conflicting commands cannot
+        // borrow the startup exemption assigned to the exact restoration path.
+        for command in [
+            cc_switch_lib::cli::commands::proxy::ProxyCommand::Config {
+                listen_address: None,
+                listen_port: None,
+                restore_enabled: Some(true),
+                expected_enabled: None,
+            },
+            cc_switch_lib::cli::commands::proxy::ProxyCommand::Config {
+                listen_address: None,
+                listen_port: Some(15722),
+                restore_enabled: Some(true),
+                expected_enabled: Some(false),
+            },
+        ] {
+            assert!(command_requires_startup_state(&Some(
+                cc_switch_lib::cli::Commands::Proxy(command)
+            )));
+        }
     }
 
     #[test]
