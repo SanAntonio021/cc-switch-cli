@@ -1162,6 +1162,11 @@ impl SkillService {
             } else if file_type.is_file() {
                 hasher.update(b"file\0");
                 hasher.update(fs::read(&path).map_err(|error| AppError::io(&path, error))?);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    hasher.update((metadata.permissions().mode() & 0o7777).to_le_bytes());
+                }
             } else {
                 hasher.update(b"other\0");
             }
@@ -4436,6 +4441,44 @@ mod tests {
                 current.content_hash
             );
             assert_no_pinned_staging(destinations[0].parent().unwrap());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial(home_settings)]
+    fn pinned_update_preserves_existing_user_permission_edits() {
+        use std::os::unix::fs::PermissionsExt;
+        for target_index in [0, 2] {
+            let home = tempfile::tempdir().unwrap();
+            let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+            let (db, source, mut current, mut updated, destinations) =
+                pinned_update_fixture(home.path());
+            for dir in destinations.iter().chain(std::iter::once(&source)) {
+                fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+                fs::set_permissions(dir.join("run.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            current.content_hash = Some(local::local_tree_hash(&destinations[0]).unwrap());
+            db.save_skill(&current).unwrap();
+            updated.content_hash = Some(local::local_tree_hash(&source).unwrap());
+            let edited = destinations[target_index].join("run.sh");
+            fs::set_permissions(&edited, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(SkillService::publish_pinned_update(&db, &source, &current, updated).is_err());
+            assert_eq!(
+                fs::metadata(&edited).unwrap().permissions().mode() & 0o7777,
+                0o755
+            );
+            assert_eq!(
+                db.get_installed_skill(&current.id)
+                    .unwrap()
+                    .unwrap()
+                    .content_hash,
+                current.content_hash
+            );
+            for dir in &destinations {
+                assert_eq!(fs::read(dir.join("SKILL.md")).unwrap(), b"old skill\n");
+                assert_no_pinned_staging(dir.parent().unwrap());
+            }
         }
     }
 
