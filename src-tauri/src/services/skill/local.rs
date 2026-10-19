@@ -107,6 +107,16 @@ pub(super) fn local_tree_hash(root: &Path) -> Result<String, AppError> {
         digest.update(name.as_bytes());
         digest.update((bytes.len() as u64).to_le_bytes());
         digest.update(bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&file)
+                .map_err(|e| AppError::io(&file, e))?
+                .permissions()
+                .mode()
+                & 0o7777;
+            digest.update(mode.to_le_bytes());
+        }
     }
     Ok(format!("local-sha256:{:x}", digest.finalize()))
 }
@@ -501,6 +511,34 @@ mod tests {
         assert!(!other.join("skills").exists());
         assert!(!ssot.join("demo").exists());
         assert_eq!(SkillService::local_info("demo").unwrap()["found"], false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_republish_preserves_existing_user_permission_edits() {
+        use std::os::unix::fs::PermissionsExt;
+        for app_copy in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+            let input = source(home.path(), "first");
+            fs::write(input.join("run.sh"), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(input.join("run.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+            install(&input, 'a').unwrap();
+            let info = SkillService::local_info("demo").unwrap();
+            let target = if app_copy {
+                SkillService::get_app_skills_dir(&AppType::Codex).unwrap()
+            } else {
+                SkillService::get_ssot_dir().unwrap()
+            }
+            .join("demo/run.sh");
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(install(&input, 'a').is_err());
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                0o755
+            );
+            assert_eq!(SkillService::local_info("demo").unwrap(), info);
+        }
     }
 
     #[test]

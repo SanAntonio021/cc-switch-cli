@@ -32,6 +32,13 @@ fn failure(message: impl Into<String>) -> AppError {
     AppError::Message(message.into())
 }
 
+// Only call for a freshly created, still-empty download TempDir. Its trusted
+// system temp parent may be an alias (e.g. /var on macOS); resolve it before
+// adding skill paths, whose links must still be rejected by publication checks.
+fn targeted_temp_root(temp: &tempfile::TempDir) -> Result<PathBuf, AppError> {
+    fs::canonicalize(temp.path()).map_err(|e| AppError::io(temp.path(), e))
+}
+
 // As with local publication, rollback leftovers may contain directories only.
 // Inspect metadata without following links, including Windows reparse points.
 fn require_pinned_empty_tree(path: &Path) -> Result<(), AppError> {
@@ -324,7 +331,8 @@ impl SkillService {
         }
         Self::validate_targeted_tree(&tree, source)?;
         let temp = tempfile::tempdir().map_err(|e| failure(e.to_string()))?;
-        let target = temp.path().join(source);
+        let temp_root = targeted_temp_root(&temp)?;
+        let target = temp_root.join(source);
         fs::create_dir_all(&target).map_err(|e| AppError::io(&target, e))?;
         // Every directory/path was validated before any file is written.
         let mut directories: Vec<_> = tree.tree.iter().filter(|e| e.kind == "tree").collect();
@@ -359,13 +367,56 @@ impl SkillService {
         .buffer_unordered(8)
         .try_collect::<Vec<_>>()
         .await?;
-        Ok(temp.keep())
+        let _ = temp.keep();
+        Ok(temp_root)
     }
 }
 
 #[cfg(test)]
 mod targeted_download_tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(home_settings)]
+    fn targeted_temp_root_resolves_parent_alias_but_preserves_skill_link_checks() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let fixture_root = fs::canonicalize(fixture.path()).unwrap();
+        let parent = fixture_root.join("physical-temp");
+        fs::create_dir(&parent).unwrap();
+        let alias = fixture_root.join("temp-alias");
+        symlink(&parent, &alias).unwrap();
+        // Model an aliased TMPDIR without changing the process environment.
+        let temp = tempfile::tempdir_in(&alias).unwrap();
+        assert!(temp.path().starts_with(&alias));
+        assert!(require_pinned_empty_tree(temp.path()).is_err());
+
+        let root = targeted_temp_root(&temp).unwrap();
+        assert_eq!(root.parent(), Some(parent.as_path()));
+        assert!(require_pinned_empty_tree(&root).is_ok());
+        let source = root.join("second/shared");
+        fs::create_dir_all(&source).unwrap();
+        let skill = entry("SKILL.md", "blob", "100644", Some(0));
+        SkillService::write_targeted_blob(&skill, b"", &source).unwrap();
+        assert!(local::local_tree_hash(&source).is_ok());
+        // Generic source checks still reject the very same tree via the alias.
+        assert!(local::local_tree_hash(&temp.path().join("second/shared")).is_err());
+
+        let linked = source.join("linked");
+        symlink(&parent, &linked).unwrap();
+        assert!(local::local_tree_hash(&source).is_err());
+        fs::remove_file(&linked).unwrap();
+        symlink(source.join("missing"), &linked).unwrap();
+        assert!(local::local_tree_hash(&source).is_err());
+        fs::remove_file(&linked).unwrap();
+        assert!(local::local_tree_hash(&source).is_ok());
+
+        drop(temp);
+        assert!(!root.exists());
+        assert!(parent.is_dir());
+    }
 
     #[test]
     #[cfg(unix)]
@@ -762,7 +813,7 @@ mod targeted_http_tests {
         );
         assert_eq!(
             stored.content_hash.as_deref(),
-            Some(SkillService::compute_dir_hash(&dest).unwrap().as_str())
+            Some(local::local_tree_hash(&dest).unwrap().as_str())
         );
         assert_eq!(
             SkillService::source_path_from_readme(&stored, None),
