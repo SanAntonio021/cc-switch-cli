@@ -5,9 +5,9 @@
 //! - 数据库存储安装记录、启用状态与仓库列表（`~/.cc-switch/cc-switch.db`）
 
 mod discovery;
-mod targeted;
 mod in_place;
 mod local;
+mod targeted;
 
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -2701,8 +2701,14 @@ impl SkillService {
     }
 
     /// Update one repository-backed Skill after an explicit user action.
-    async fn update_skill(&self, skill_id: &str, source_commit: Option<&str>) -> Result<SkillUpdateOutcome, AppError> {
-        if let Some(commit) = source_commit { Self::validate_source_commit(commit)?; }
+    async fn update_skill(
+        &self,
+        skill_id: &str,
+        source_commit: Option<&str>,
+    ) -> Result<SkillUpdateOutcome, AppError> {
+        if let Some(commit) = source_commit {
+            Self::validate_source_commit(commit)?;
+        }
         let db = Database::init()?;
         let mut skill = db
             .get_installed_skill(skill_id)?
@@ -2729,12 +2735,19 @@ impl SkillService {
         };
 
         let targeted_source = if source_commit.is_some() {
-            Some(Self::source_path_from_readme(&skill, None).ok_or_else(||
-                AppError::InvalidInput("Pinned update requires an exact GitHub source path in readme_url".into()))?)
-        } else { None };
+            Some(Self::source_path_from_readme(&skill, None).ok_or_else(|| {
+                AppError::InvalidInput(
+                    "Pinned update requires an exact GitHub source path in readme_url".into(),
+                )
+            })?)
+        } else {
+            None
+        };
         let download = async {
             if let Some(commit) = source_commit {
-                let path = self.download_targeted_skill(&repo, commit, targeted_source.as_deref().unwrap()).await?;
+                let path = self
+                    .download_targeted_skill(&repo, commit, targeted_source.as_deref().unwrap())
+                    .await?;
                 Ok((path, repo.branch.clone()))
             } else {
                 self.download_repo_for_update(&repo).await
@@ -2872,7 +2885,11 @@ impl SkillService {
         self.update_skills_at_commit(ids, None).await
     }
 
-    pub async fn update_skills_at_commit(&self, ids: &[String], source_commit: Option<&str>) -> SkillUpdateBatchResult {
+    pub async fn update_skills_at_commit(
+        &self,
+        ids: &[String],
+        source_commit: Option<&str>,
+    ) -> SkillUpdateBatchResult {
         let mut result = SkillUpdateBatchResult::default();
         let mut seen = HashSet::new();
         for id in ids {
@@ -3152,8 +3169,15 @@ impl SkillService {
         self.install_at_commit(spec, app, None).await
     }
 
-    pub async fn install_at_commit(&self, spec: &str, app: &AppType, source_commit: Option<&str>) -> Result<InstalledSkill, AppError> {
-        if let Some(commit) = source_commit { Self::validate_source_commit(commit)?; }
+    pub async fn install_at_commit(
+        &self,
+        spec: &str,
+        app: &AppType,
+        source_commit: Option<&str>,
+    ) -> Result<InstalledSkill, AppError> {
+        if let Some(commit) = source_commit {
+            Self::validate_source_commit(commit)?;
+        }
         let spec = spec.trim();
         if spec.is_empty() {
             return Err(AppError::InvalidInput("Skill 不能为空".to_string()));
@@ -3164,9 +3188,14 @@ impl SkillService {
 
         // Resolve spec to a discoverable skill.
         let discoverable = if source_commit.is_some() {
-            discoverable_from_repo_spec(spec).ok_or_else(|| AppError::InvalidInput(
-                "Pinned install requires owner/repo:exact/source/path".into()))?
-        } else { self.resolve_install_spec(&index, spec).await? };
+            discoverable_from_repo_spec(spec).ok_or_else(|| {
+                AppError::InvalidInput(
+                    "Pinned install requires owner/repo:exact/source/path".into(),
+                )
+            })?
+        } else {
+            self.resolve_install_spec(&index, spec).await?
+        };
 
         // Repository sources may be nested, but the installed directory is one safe segment.
         let source_rel =
@@ -3189,7 +3218,9 @@ impl SkillService {
         let new_repo = format!("{}/{}", discoverable.repo_owner, discoverable.repo_name);
         let needs_download = {
             let _state_guard = skill_state_write_guard();
-            if source_commit.is_some() { Self::reject_pinned_existing_install(&install_name)?; }
+            if source_commit.is_some() {
+                Self::reject_pinned_existing_install(&install_name)?;
+            }
             if let Some(existing) = Self::reuse_existing_install(&discoverable, &install_name, app)?
             {
                 return Ok(existing);
@@ -3214,9 +3245,13 @@ impl SkillService {
                 std::time::Duration::from_secs(SKILL_REPO_DOWNLOAD_TIMEOUT_SECS),
                 async {
                     if let Some(commit) = source_commit {
-                        let path = self.download_targeted_skill(&repo, commit, &source_rel).await?;
+                        let path = self
+                            .download_targeted_skill(&repo, commit, &source_rel)
+                            .await?;
                         Ok((path, repo.branch.clone()))
-                    } else { self.download_repo(&repo).await }
+                    } else {
+                        self.download_repo(&repo).await
+                    }
                 },
             )
             .await
@@ -3273,7 +3308,9 @@ impl SkillService {
         // Network I/O is complete. Re-check under the write guard before any
         // SSOT or database mutation, then keep the projection consistent.
         let _state_guard = skill_state_write_guard();
-        if source_commit.is_some() { Self::reject_pinned_existing_install(&install_name)?; }
+        if source_commit.is_some() {
+            Self::reject_pinned_existing_install(&install_name)?;
+        }
         if let Some(existing) = Self::reuse_existing_install(&discoverable, &install_name, app)? {
             return Ok(existing);
         }
@@ -4221,24 +4258,33 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
         let ssot = SkillService::get_ssot_dir().unwrap().join("demo");
-        let dest = SkillService::get_app_skills_dir(&AppType::Codex).unwrap().join("demo");
+        let dest = SkillService::get_app_skills_dir(&AppType::Codex)
+            .unwrap()
+            .join("demo");
         fs::create_dir_all(&ssot).unwrap();
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(ssot.join("SKILL.md"), "new").unwrap();
         match symlink_dir(&ssot, &dest) {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(1314) => {
                 eprintln!("app link test unavailable: Windows symlink privilege not granted");
                 return;
-            },
+            }
             Err(e) => panic!("create app link: {e}"),
         }
-        let _link = fs::OpenOptions::new().read(true).share_mode(3)
-            .custom_flags(0x02200000).open(&dest).unwrap();
+        let _link = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(0x02200000)
+            .open(&dest)
+            .unwrap();
         SkillService::sync_to_app_dir("demo", &AppType::Codex, SyncMethod::Auto).unwrap();
         SkillService::sync_updated_skill_to_app("demo", &AppType::Codex, SyncMethod::Auto).unwrap();
         assert!(SkillService::is_symlink(&dest));
-        assert_eq!(fs::canonicalize(&dest).unwrap(), fs::canonicalize(&ssot).unwrap());
+        assert_eq!(
+            fs::canonicalize(&dest).unwrap(),
+            fs::canonicalize(&ssot).unwrap()
+        );
     }
 
     #[test]
@@ -4248,15 +4294,21 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
         let ssot = SkillService::get_ssot_dir().unwrap().join("demo");
-        let dest = SkillService::get_app_skills_dir(&AppType::Codex).unwrap().join("demo");
+        let dest = SkillService::get_app_skills_dir(&AppType::Codex)
+            .unwrap()
+            .join("demo");
         fs::create_dir_all(ssot.join("references")).unwrap();
         fs::create_dir_all(dest.join("references")).unwrap();
         fs::write(ssot.join("SKILL.md"), "new").unwrap();
         fs::write(ssot.join("references/new.md"), "added").unwrap();
         fs::write(dest.join("SKILL.md"), "old").unwrap();
         fs::write(dest.join("references/old.md"), "removed").unwrap();
-        let _watch = fs::OpenOptions::new().read(true).share_mode(3)
-            .custom_flags(0x02000000).open(dest.join("references")).unwrap();
+        let _watch = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(0x02000000)
+            .open(dest.join("references"))
+            .unwrap();
         assert!(fs::rename(&dest, dest.with_extension("moved")).is_err());
         SkillService::sync_updated_skill_to_app("demo", &AppType::Codex, SyncMethod::Copy).unwrap();
         SkillService::sync_to_app_dir("demo", &AppType::Codex, SyncMethod::Auto).unwrap();

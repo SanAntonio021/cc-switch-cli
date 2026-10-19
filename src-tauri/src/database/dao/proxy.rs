@@ -1305,9 +1305,16 @@ mod proxy_flag_restore_tests {
         tables
             .into_iter()
             .map(|table| {
-                let sql = format!("SELECT * FROM \"{}\" ORDER BY rowid", table.replace('"', "\"\""));
+                let sql = format!(
+                    "SELECT * FROM \"{}\" ORDER BY rowid",
+                    table.replace('"', "\"\"")
+                );
                 let mut stmt = conn.prepare(&sql).expect("snapshot table");
-                let columns: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+                let columns: Vec<String> = stmt
+                    .column_names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
                 let rows = stmt
                     .query_map([], |row| {
                         (0..columns.len())
@@ -1335,7 +1342,7 @@ mod proxy_flag_restore_tests {
                  VALUES ('provider-fixture', 'codex', 'Fixture', '{\"token\":\"test-only\"}', 1);
                  INSERT INTO mcp_servers (id, name, server_config, enabled_codex)
                  VALUES ('mcp-fixture', 'Fixture', '{\"command\":\"fixture\"}', 1);
-                 INSERT INTO settings (key, value) VALUES ('flag-restore-fixture', 'unchanged');"
+                 INSERT INTO settings (key, value) VALUES ('flag-restore-fixture', 'unchanged');",
             )
             .expect("seed fixtures");
         }
@@ -1352,14 +1359,27 @@ mod proxy_flag_restore_tests {
         let (columns, rows) = before.get_mut("proxy_config").expect("proxy snapshot");
         let app_index = columns.iter().position(|name| name == "app_type").unwrap();
         let enabled_index = columns.iter().position(|name| name == "enabled").unwrap();
-        let updated_index = columns.iter().position(|name| name == "updated_at").unwrap();
-        let old_row = rows.iter_mut().find(|row| row[app_index] == Value::Text("codex".into())).unwrap();
-        let new_row = after["proxy_config"].1.iter().find(|row| row[app_index] == Value::Text("codex".into())).unwrap();
+        let updated_index = columns
+            .iter()
+            .position(|name| name == "updated_at")
+            .unwrap();
+        let old_row = rows
+            .iter_mut()
+            .find(|row| row[app_index] == Value::Text("codex".into()))
+            .unwrap();
+        let new_row = after["proxy_config"]
+            .1
+            .iter()
+            .find(|row| row[app_index] == Value::Text("codex".into()))
+            .unwrap();
         assert_eq!(new_row[enabled_index], Value::Integer(1));
         assert_ne!(new_row[updated_index], old_row[updated_index]);
         old_row[enabled_index] = new_row[enabled_index].clone();
         old_row[updated_index] = new_row[updated_index].clone();
-        assert_eq!(before, after, "every other database value must remain unchanged");
+        assert_eq!(
+            before, after,
+            "every other database value must remain unchanged"
+        );
     }
 
     #[test]
@@ -1367,7 +1387,9 @@ mod proxy_flag_restore_tests {
         let db = seeded_database();
         let before = snapshot(&db);
         let total_changes = || {
-            db.conn.lock().unwrap()
+            db.conn
+                .lock()
+                .unwrap()
                 .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
                 .expect("read change count")
         };

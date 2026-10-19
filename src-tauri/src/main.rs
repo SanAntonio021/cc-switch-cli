@@ -101,10 +101,15 @@ fn command_requires_startup_state(command: &Option<Commands>) -> bool {
     ) {
         return false;
     }
-    if matches!(command, Some(Commands::Skills(
-        cc_switch_lib::cli::commands::skills::SkillsCommand::InstallLocal { .. }
-        | cc_switch_lib::cli::commands::skills::SkillsCommand::LocalInfo { .. }
-    ))) { return false; }
+    if matches!(
+        command,
+        Some(Commands::Skills(
+            cc_switch_lib::cli::commands::skills::SkillsCommand::InstallLocal { .. }
+                | cc_switch_lib::cli::commands::skills::SkillsCommand::LocalInfo { .. }
+        ))
+    ) {
+        return false;
+    }
     #[cfg(unix)]
     if std::env::var_os(cc_switch_lib::daemon::supervisor::DAEMON_SOCKET_ENV).is_some() {
         return false;
@@ -117,7 +122,9 @@ fn command_requires_startup_state(command: &Option<Commands>) -> bool {
         | Some(Commands::Internal(_))
         | Some(Commands::Sessions(_))
         | Some(Commands::Skills(_))
-        | Some(Commands::Config(cc_switch_lib::cli::commands::config::ConfigCommand::Backup { .. }))
+        | Some(Commands::Config(cc_switch_lib::cli::commands::config::ConfigCommand::Backup {
+            ..
+        }))
         | Some(Commands::Settings(
             cc_switch_lib::cli::commands::settings::SettingsCommand::CodexAuthPreservation(_),
         )) => false,
@@ -128,6 +135,15 @@ fn command_requires_startup_state(command: &Option<Commands>) -> bool {
 }
 
 fn initialize_startup_state_if_needed(command: &Option<Commands>) -> Result<(), AppError> {
+    if matches!(
+        command,
+        Some(Commands::Skills(_))
+            | Some(Commands::Config(
+                cc_switch_lib::cli::commands::config::ConfigCommand::Backup { .. }
+            ))
+    ) {
+        guard_legacy_first_start(command, &cc_switch_lib::get_app_config_dir())?;
+    }
     if command_requires_startup_state(command) {
         let _state = if command_uses_deferred_codex_migration(command) {
             // Mirrors upstream's non-blocking GUI startup for the long-lived TUI.
@@ -137,6 +153,41 @@ fn initialize_startup_state_if_needed(command: &Option<Commands>) -> Result<(), 
             // completes, so finish the same upstream migration sequence inline.
             cc_switch_lib::AppState::try_new_with_startup_recovery()?
         };
+    }
+    Ok(())
+}
+
+fn guard_legacy_first_start(
+    command: &Option<Commands>,
+    config_dir: &std::path::Path,
+) -> Result<(), AppError> {
+    use cc_switch_lib::cli::commands::skills::SkillsCommand;
+
+    // Only newly exempted commands that can initialize SQLite need this gate.
+    // Keep upstream exemptions and commands that never create a database usable.
+    let may_initialize_database = match command {
+        Some(Commands::Skills(
+            SkillsCommand::LocalInfo { .. }
+            | SkillsCommand::Market { .. }
+            | SkillsCommand::SyncMethod { .. }
+            | SkillsCommand::StorageLocation { location: None },
+        )) => false,
+        Some(Commands::Skills(_))
+        | Some(Commands::Config(cc_switch_lib::cli::commands::config::ConfigCommand::Backup {
+            ..
+        })) => true,
+        _ => false,
+    };
+    if may_initialize_database
+        && !config_dir.join("cc-switch.db").exists()
+        && ["config.json", "skills.json"]
+            .iter()
+            .any(|name| config_dir.join(name).exists())
+    {
+        return Err(AppError::Config(
+            "Legacy config.json or skills.json requires migration before this command; run cc-switch normally (without a subcommand) to migrate first."
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -156,7 +207,8 @@ fn database_access_required(command: &Option<Commands>) -> bool {
 mod tests {
     use super::{
         command_requires_startup_state, command_uses_deferred_codex_migration,
-        command_uses_own_logger, database_access_required, initialize_startup_state_if_needed,
+        command_uses_own_logger, database_access_required, guard_legacy_first_start,
+        initialize_startup_state_if_needed,
     };
     use cc_switch_lib::cli::Cli;
     use clap::Parser;
@@ -194,6 +246,152 @@ mod tests {
             .expect("set future schema version");
     }
 
+    #[test]
+    fn legacy_first_start_rejects_database_initializers_without_writes() {
+        for legacy in ["config.json", "skills.json"] {
+            let temp = tempfile::tempdir().expect("create temp dir");
+            let path = temp.path().join(legacy);
+            let original = b"{\"synthetic-legacy\":true}\n";
+            std::fs::write(&path, original).expect("write legacy sentinel");
+            for args in [
+                vec!["cc-switch", "skills", "list"],
+                vec!["cc-switch", "skills", "repos", "list"],
+                vec![
+                    "cc-switch",
+                    "skills",
+                    "install-local",
+                    "--source-dir",
+                    "/synthetic",
+                    "--name",
+                    "demo",
+                    "--source-repo",
+                    "owner/repo",
+                    "--source-path",
+                    "demo",
+                    "--source-commit",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ],
+                vec!["cc-switch", "skills", "install", "owner/repo:demo"],
+                vec![
+                    "cc-switch",
+                    "skills",
+                    "update",
+                    "demo",
+                    "--source-commit",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ],
+                vec!["cc-switch", "skills", "storage-location", "unified"],
+                vec!["cc-switch", "config", "backup"],
+            ] {
+                let cli = Cli::try_parse_from(args).expect("parse guarded command");
+                let error = guard_legacy_first_start(&cli.command, temp.path())
+                    .expect_err("legacy files must be migrated before database initialization");
+                assert!(error.to_string().contains("run cc-switch normally"));
+                assert_eq!(
+                    std::fs::read(&path).expect("read legacy sentinel"),
+                    original.as_slice()
+                );
+                assert_eq!(
+                    std::fs::read_dir(temp.path())
+                        .expect("list fixture")
+                        .count(),
+                    1
+                );
+                assert!(!temp.path().join("cc-switch.db").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_first_start_preserves_existing_exemptions_and_readonly_commands() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(temp.path().join("config.json"), b"{}").expect("write legacy sentinel");
+        for args in [
+            vec![
+                "cc-switch",
+                "skills",
+                "local-info",
+                "--name",
+                "demo",
+                "--json",
+            ],
+            vec!["cc-switch", "skills", "market", "demo"],
+            vec!["cc-switch", "skills", "sync-method"],
+            vec!["cc-switch", "skills", "sync-method", "copy"],
+            vec!["cc-switch", "skills", "storage-location"],
+            vec!["cc-switch", "auth", "status"],
+            vec!["cc-switch", "sessions", "list"],
+            vec!["cc-switch", "update"],
+            vec!["cc-switch", "completions", "bash"],
+            vec![
+                "cc-switch",
+                "internal",
+                "capture-codex-temp",
+                "official",
+                "/synthetic",
+            ],
+            vec!["cc-switch", "settings", "codex-auth-preservation", "show"],
+            vec![
+                "cc-switch",
+                "proxy",
+                "config",
+                "--restore-enabled",
+                "true",
+                "--expected-enabled",
+                "false",
+            ],
+            vec!["cc-switch", "provider", "list"],
+            vec!["cc-switch"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parse unguarded command");
+            guard_legacy_first_start(&cli.command, temp.path()).expect("preserve command behavior");
+        }
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("list fixture")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_first_start_allows_fresh_and_existing_databases() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let cli = Cli::parse_from(["cc-switch", "skills", "list"]);
+        guard_legacy_first_start(&cli.command, temp.path()).expect("fresh installation allowed");
+        seed_future_schema_database(temp.path());
+        std::fs::write(temp.path().join("skills.json"), b"{}").expect("write legacy sentinel");
+        // Existing/future databases retain their own schema handling downstream.
+        guard_legacy_first_start(&cli.command, temp.path()).expect("existing database allowed");
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_first_start_entrypoint_refuses_writers_and_allows_local_info() {
+        for legacy in ["config.json", "skills.json"] {
+            let temp = tempfile::tempdir().expect("create temp dir");
+            std::fs::write(temp.path().join(legacy), b"{}").expect("write legacy sentinel");
+            let _guard = ConfigDirEnvGuard::set(temp.path());
+            let writer = Cli::parse_from(["cc-switch", "skills", "list"]);
+            initialize_startup_state_if_needed(&writer.command).expect_err("reject legacy writer");
+            let reader = Cli::parse_from([
+                "cc-switch",
+                "skills",
+                "local-info",
+                "--name",
+                "demo",
+                "--json",
+            ]);
+            initialize_startup_state_if_needed(&reader.command).expect("allow readonly info");
+            assert_eq!(
+                std::fs::read_dir(temp.path())
+                    .expect("list fixture")
+                    .count(),
+                1
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn daemon_start_uses_daemon_file_logger() {
@@ -205,8 +403,15 @@ mod tests {
     #[test]
     fn proxy_flag_restore_skips_startup_state_only_for_exact_restore_config() {
         let restore = Cli::try_parse_from([
-            "cc-switch", "--app", "codex", "proxy", "config",
-            "--restore-enabled", "true", "--expected-enabled", "false",
+            "cc-switch",
+            "--app",
+            "codex",
+            "proxy",
+            "config",
+            "--restore-enabled",
+            "true",
+            "--expected-enabled",
+            "false",
         ])
         .expect("parse restoration command");
         assert!(!command_requires_startup_state(&restore.command));
@@ -214,7 +419,13 @@ mod tests {
         for command in [
             vec!["cc-switch", "proxy", "config"],
             vec!["cc-switch", "proxy", "config", "--listen-port", "15722"],
-            vec!["cc-switch", "proxy", "config", "--listen-address", "localhost"],
+            vec![
+                "cc-switch",
+                "proxy",
+                "config",
+                "--listen-address",
+                "localhost",
+            ],
             vec!["cc-switch", "proxy", "enable"],
             vec!["cc-switch", "proxy", "disable"],
             vec!["cc-switch", "proxy", "serve"],
