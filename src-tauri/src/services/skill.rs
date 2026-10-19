@@ -2805,6 +2805,22 @@ impl SkillService {
         let ssot_dir = Self::get_ssot_dir()?;
         let sync_method = Self::get_sync_method()?;
         let dest = ssot_dir.join(&directory);
+        if let Some(commit) = source_commit {
+            let mut updated = current.clone();
+            updated.name = new_name;
+            updated.description = new_description;
+            updated.repo_branch = Some(used_branch.clone());
+            let doc_path = source_relative.join("SKILL.md");
+            updated.readme_url = Some(Self::build_skill_doc_url(
+                &owner,
+                &name,
+                commit,
+                &doc_path.to_string_lossy().replace('\\', "/"),
+            ));
+            updated.content_hash = Some(content_hash);
+            updated.updated_at = Utc::now().timestamp();
+            return Self::publish_pinned_update(&db, &source, &current, updated);
+        }
         let pi_deployment = if current.apps.pi {
             let pi_dir = Self::get_distinct_app_skills_dir(&ssot_dir, &AppType::Pi)?;
             Self::inspect_pi_skill_destination(&dest, &pi_dir.join(&directory))?
@@ -2886,6 +2902,108 @@ impl SkillService {
             }
         }
 
+        Ok(SkillUpdateOutcome {
+            skill: updated,
+            deployment_failures,
+        })
+    }
+
+    // A pinned publication commits metadata only after every physical copy is
+    // deployed. Existing SSOT links follow the same transaction automatically.
+    fn publish_pinned_update(
+        db: &Database,
+        source: &Path,
+        current: &InstalledSkill,
+        updated: InstalledSkill,
+    ) -> Result<SkillUpdateOutcome, AppError> {
+        fn abort(mut updates: Vec<in_place::Update>, cause: AppError) -> AppError {
+            let mut failures = Vec::new();
+            while let Some(mut update) = updates.pop() {
+                match update.rollback() {
+                    Ok(()) => {
+                        if let Err(error) = update.commit() {
+                            failures.push(error.to_string());
+                        }
+                    }
+                    Err(error) => failures.push(error.to_string()),
+                }
+            }
+            AppError::Message(if failures.is_empty() {
+                format!("{cause}; pinned skill rollback verified")
+            } else {
+                format!(
+                    "{cause}; recovery incomplete; retained journals: {}",
+                    failures.join("; ")
+                )
+            })
+        }
+        let ssot_dir = Self::get_ssot_dir()?;
+        let ssot = in_place::managed_path(&ssot_dir.join(&current.directory))?;
+        if let Some(expected) = &current.content_hash {
+            if &Self::compute_dir_hash(&ssot)? != expected {
+                return Err(AppError::InvalidInput(
+                    "Installed SSOT has local edits; refusing update".into(),
+                ));
+            }
+        }
+        let mut destinations = vec![ssot.clone()];
+        for app in Self::supported_skill_apps().filter(|a| current.apps.is_enabled_for(a)) {
+            let dest = Self::get_distinct_app_skills_dir(&ssot_dir, &app)?.join(&current.directory);
+            if Self::is_symlink(&dest) {
+                if Self::paths_equal(&dest, &ssot) {
+                    continue;
+                }
+                return Err(AppError::InvalidInput(
+                    "Foreign application skill link conflict".into(),
+                ));
+            }
+            let dest = in_place::managed_path(&dest)?;
+            if destinations
+                .iter()
+                .any(|other| Self::paths_equal(other, &dest))
+            {
+                continue;
+            }
+            if destinations
+                .iter()
+                .any(|other| Self::paths_overlap(other, &dest))
+            {
+                return Err(AppError::InvalidInput(
+                    "Overlapping application skill destinations".into(),
+                ));
+            }
+            if dest.exists()
+                && Self::compute_pi_deployment_hash(&dest)?
+                    != Self::compute_pi_deployment_hash(&ssot)?
+            {
+                return Err(AppError::InvalidInput(
+                    "Application skill has local edits; refusing update".into(),
+                ));
+            }
+            destinations.push(dest);
+        }
+        let mut prepared = Vec::new();
+        for dest in &destinations {
+            match in_place::Update::prepare(source, dest) {
+                Ok(update) => prepared.push(update),
+                Err(error) => return Err(abort(prepared, error)),
+            }
+        }
+        for index in 0..prepared.len() {
+            if let Err(error) = prepared[index].apply() {
+                return Err(abort(prepared, error));
+            }
+        }
+        if let Err(error) = db.save_skill(&updated) {
+            return Err(abort(prepared, error));
+        }
+        let mut deployment_failures = Vec::new();
+        for update in prepared {
+            if let Err(error) = update.commit() {
+                log::warn!("Pinned skill staging cleanup failed: {error}");
+                deployment_failures.push(format!("Staging cleanup: {error}"));
+            }
+        }
         Ok(SkillUpdateOutcome {
             skill: updated,
             deployment_failures,
@@ -4086,6 +4204,153 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".skill-in-place-")));
+    }
+
+    fn pinned_update_fixture(
+        home: &Path,
+    ) -> (
+        Database,
+        PathBuf,
+        InstalledSkill,
+        InstalledSkill,
+        Vec<PathBuf>,
+    ) {
+        let (source, mut current) = pinned_source_fixture(home);
+        current.apps = SkillApps::only(&AppType::Codex);
+        current.apps.claude = true;
+        let mut destinations = vec![SkillService::get_ssot_dir()
+            .unwrap()
+            .join(&current.directory)];
+        for app in [AppType::Claude, AppType::Codex] {
+            destinations.push(
+                SkillService::get_app_skills_dir(&app)
+                    .unwrap()
+                    .join(&current.directory),
+            );
+        }
+        for dest in &destinations {
+            fs::create_dir_all(dest).unwrap();
+            fs::write(dest.join("SKILL.md"), "old skill\n").unwrap();
+        }
+        current.content_hash = Some(SkillService::compute_dir_hash(&destinations[0]).unwrap());
+        let db = Database::init().unwrap();
+        db.save_skill(&current).unwrap();
+        let mut updated = current.clone();
+        updated.readme_url = Some(format!(
+            "https://github.com/owner/repo/blob/{}/shared/SKILL.md",
+            "b".repeat(40)
+        ));
+        updated.content_hash = Some(SkillService::compute_dir_hash(&source).unwrap());
+        updated.updated_at = 123;
+        (db, source, current, updated, destinations)
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_update_metadata_failure_rolls_back_every_app_then_retries() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let (db, source, current, updated, destinations) = pinned_update_fixture(home.path());
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_pinned_update BEFORE UPDATE ON skills BEGIN SELECT RAISE(ABORT, 'injected pinned save failure'); END;").unwrap();
+        let error = SkillService::publish_pinned_update(&db, &source, &current, updated.clone())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("rollback verified"), "{error}");
+        assert_eq!(
+            db.get_installed_skill(&current.id)
+                .unwrap()
+                .unwrap()
+                .readme_url,
+            current.readme_url
+        );
+        for dest in &destinations {
+            assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"old skill\n");
+            assert!(!dest.join("references/detail.md").exists());
+            assert_no_pinned_staging(dest.parent().unwrap());
+        }
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_pinned_update;")
+            .unwrap();
+        let outcome =
+            SkillService::publish_pinned_update(&db, &source, &current, updated.clone()).unwrap();
+        assert!(outcome.deployment_failures.is_empty());
+        assert_eq!(
+            db.get_installed_skill(&current.id)
+                .unwrap()
+                .unwrap()
+                .readme_url,
+            updated.readme_url
+        );
+        for dest in &destinations {
+            assert_eq!(
+                SkillService::compute_pi_deployment_hash(dest).unwrap(),
+                SkillService::compute_pi_deployment_hash(&source).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_update_preserves_user_app_edits_before_ssot_write() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let (db, source, current, updated, destinations) = pinned_update_fixture(home.path());
+        fs::write(destinations[2].join(".user"), "keep").unwrap();
+        let error = SkillService::publish_pinned_update(&db, &source, &current, updated)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("local edits"));
+        for dest in &destinations {
+            assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"old skill\n");
+        }
+        assert_eq!(fs::read(destinations[2].join(".user")).unwrap(), b"keep");
+        assert_eq!(
+            db.get_installed_skill(&current.id)
+                .unwrap()
+                .unwrap()
+                .readme_url,
+            current.readme_url
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial(home_settings)]
+    fn pinned_update_locked_app_file_rolls_back_ssot_and_other_apps() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let (db, source, current, updated, destinations) = pinned_update_fixture(home.path());
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(destinations[2].join("SKILL.md"))
+            .unwrap();
+        let error = SkillService::publish_pinned_update(&db, &source, &current, updated.clone())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("rollback verified"), "{error}");
+        for dest in &destinations {
+            assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"old skill\n");
+            assert!(!dest.join("references/detail.md").exists());
+            assert_no_pinned_staging(dest.parent().unwrap());
+        }
+        assert_eq!(
+            db.get_installed_skill(&current.id)
+                .unwrap()
+                .unwrap()
+                .readme_url,
+            current.readme_url
+        );
+        drop(locked);
+        assert!(
+            SkillService::publish_pinned_update(&db, &source, &current, updated)
+                .unwrap()
+                .deployment_failures
+                .is_empty()
+        );
     }
 
     #[test]

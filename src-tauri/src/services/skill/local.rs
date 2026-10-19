@@ -276,7 +276,7 @@ impl SkillService {
             .as_ref()
             .map(|s| s.apps.clone())
             .unwrap_or_else(|| SkillApps::only(app));
-        let mut destinations = vec![ssot.clone()];
+        let mut destinations = vec![in_place::managed_path(&ssot)?];
         for target in Self::supported_skill_apps().filter(|a| apps.is_enabled_for(a)) {
             let dest =
                 Self::get_distinct_app_skills_dir(&Self::get_ssot_dir()?, &target)?.join(name);
@@ -287,6 +287,13 @@ impl SkillService {
                     continue;
                 }
                 return Err(invalid("Foreign application link conflict"));
+            }
+            let dest = in_place::managed_path(&dest)?;
+            if destinations
+                .iter()
+                .any(|other| !Self::paths_equal(other, &dest) && Self::paths_overlap(other, &dest))
+            {
+                return Err(invalid("Local skill deployment targets cannot overlap"));
             }
             if let Some(old) = &existing {
                 if dest.exists() {
@@ -299,7 +306,14 @@ impl SkillService {
             } else {
                 require_file_empty_target(&dest, "Unmanaged application directory conflict")?;
             }
-            destinations.push(dest);
+            // Compare physical paths, while retaining managed-path/link checks
+            // for every app. Shared app directories need only one transaction.
+            if !destinations
+                .iter()
+                .any(|other| Self::paths_equal(other, &dest))
+            {
+                destinations.push(dest);
+            }
         }
         // Prepare every file tree before any deployment mutation. Copies for new
         // projections avoid needing symlink privileges; existing SSOT links survive.
@@ -682,6 +696,122 @@ mod tests {
         }
         assert_eq!(install(&input, 'b').unwrap()["action"], "unchanged");
     }
+
+    fn shared_app_directory_update(aliased_parent: bool) {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let shared = home.path().join("shared/config");
+        fs::create_dir_all(&shared).unwrap();
+        let claude = if aliased_parent {
+            #[cfg(unix)]
+            {
+                let alias = home.path().join("alias");
+                std::os::unix::fs::symlink(home.path().join("shared"), &alias).unwrap();
+                alias.join("config")
+            }
+            #[cfg(not(unix))]
+            {
+                unreachable!("parent alias fixture is Unix-only")
+            }
+        } else {
+            shared.clone()
+        };
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
+        let mut settings = crate::settings::get_settings();
+        settings.codex_config_dir = Some(shared.to_string_lossy().into_owned());
+        crate::settings::update_settings(settings).unwrap();
+        let input = source(home.path(), "first");
+        fs::write(input.join("obsolete.bin"), [1, 2, 3]).unwrap();
+        install(&input, 'a').unwrap();
+        let db = Database::init().unwrap();
+        let mut row = db.get_installed_skill("local:demo").unwrap().unwrap();
+        row.apps.claude = true;
+        db.save_skill(&row).unwrap();
+
+        source(home.path(), "second");
+        fs::remove_file(input.join("obsolete.bin")).unwrap();
+        fs::write(input.join(".private"), [0, 255, 13, 10]).unwrap();
+        let result = install(&input, 'b').unwrap();
+        assert_eq!(result["action"], "updated");
+        assert_eq!(result["skill"]["apps"]["claude"], true);
+        assert_eq!(result["skill"]["apps"]["codex"], true);
+        for target in [
+            SkillService::get_ssot_dir().unwrap().join("demo"),
+            shared.join("skills/demo"),
+        ] {
+            assert_eq!(
+                local_tree_hash(&target).unwrap(),
+                local_tree_hash(&input).unwrap()
+            );
+            assert!(!target.join("obsolete.bin").exists());
+        }
+        assert_eq!(install(&input, 'b').unwrap()["action"], "unchanged");
+        let before = SkillService::local_info("demo").unwrap();
+        fs::write(shared.join("skills/demo/.private"), "user edit").unwrap();
+        source(home.path(), "third");
+        assert!(install(&input, 'c')
+            .unwrap_err()
+            .to_string()
+            .contains("local edits"));
+        assert_eq!(SkillService::local_info("demo").unwrap(), before);
+        assert_eq!(
+            fs::read(shared.join("skills/demo/.private")).unwrap(),
+            b"user edit"
+        );
+    }
+
+    #[test]
+    fn local_install_updates_shared_claude_codex_directory_once() {
+        shared_app_directory_update(false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_install_deduplicates_shared_directory_through_parent_alias() {
+        shared_app_directory_update(true);
+    }
+
+    #[test]
+    fn local_install_rejects_nested_app_targets_before_mutation() {
+        // Exercise both ancestor orders in supported_skill_apps().
+        for claude_is_outer in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+            let input = source(home.path(), "first");
+            install(&input, 'a').unwrap();
+            let outer_config = crate::codex_config::get_codex_config_dir();
+            let outer = outer_config.join("skills/demo");
+            let inner_config = outer.join("nested");
+            fs::create_dir_all(&inner_config).unwrap();
+            let inner = inner_config.join("skills/demo");
+            let (claude, codex) = if claude_is_outer {
+                (&outer_config, &inner_config)
+            } else {
+                (&inner_config, &outer_config)
+            };
+            std::env::set_var("CLAUDE_CONFIG_DIR", claude);
+            let mut settings = crate::settings::get_settings();
+            settings.codex_config_dir = Some(codex.to_string_lossy().into_owned());
+            crate::settings::update_settings(settings).unwrap();
+            let db = Database::init().unwrap();
+            let mut row = db.get_installed_skill("local:demo").unwrap().unwrap();
+            row.apps.claude = true;
+            db.save_skill(&row).unwrap();
+            let before = SkillService::local_info("demo").unwrap();
+            let ssot = SkillService::get_ssot_dir().unwrap().join("demo");
+            let ssot_before = local_tree_hash(&ssot).unwrap();
+            let outer_before = local_tree_hash(&outer).unwrap();
+            source(home.path(), "second");
+
+            let error = install(&input, 'b').unwrap_err().to_string();
+            assert!(error.contains("targets cannot overlap"), "{error}");
+            assert_eq!(local_tree_hash(&ssot).unwrap(), ssot_before);
+            assert_eq!(local_tree_hash(&outer).unwrap(), outer_before);
+            assert!(!inner.exists());
+            assert_eq!(SkillService::local_info("demo").unwrap(), before);
+        }
+    }
+
     #[test]
     fn local_schema20_update_preserves_pi_mcp_unknown_skill_fields_and_settings() {
         let home = tempfile::tempdir().unwrap();

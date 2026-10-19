@@ -267,7 +267,16 @@ impl SkillService {
             .create_new(true)
             .open(&dest)
             .map_err(|e| AppError::io(&dest, e))?;
-        file.write_all(bytes).map_err(|e| AppError::io(&dest, e))
+        file.write_all(bytes).map_err(|e| AppError::io(&dest, e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if entry.mode == "100755" { 0o755 } else { 0o644 };
+            // Set the final mode explicitly: creation permissions are masked by umask.
+            file.set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|e| AppError::io(&dest, e))?;
+        }
+        Ok(())
     }
 
     pub(super) async fn download_targeted_skill(
@@ -831,6 +840,97 @@ mod targeted_http_tests {
             url::Url::parse(&format!("http://{address}/blob")).unwrap(),
             handle,
         )
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn targeted_git_modes_survive_umask_and_in_place_deployment() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        const CHILD: &str = "CC_SWITCH_TEST_TARGETED_GIT_MODES_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Match the existing umask regression pattern: never change the
+            // parent test process's mask while other tests may be writing files.
+            for mask in [0o077, 0o000] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "services::skill::targeted::targeted_http_tests::targeted_git_modes_survive_umask_and_in_place_deployment",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1");
+                unsafe {
+                    command.pre_exec(move || {
+                        libc::umask(mask);
+                        Ok(())
+                    });
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "umask {mask:o}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(temp.path());
+        let source = temp.path().join("download");
+        let (url, thread) = server(b"abc");
+        let bytes = SkillService::targeted_bytes(url, 3).await.unwrap();
+        thread.join().unwrap();
+        let files = [
+            ("SKILL.md", "100644", 0o644),
+            ("scripts/run.sh", "100755", 0o755),
+        ];
+        for (path, mode, expected) in files {
+            let entry = GitEntry {
+                path: path.into(),
+                kind: "blob".into(),
+                mode: mode.into(),
+                size: Some(3),
+                sha: "f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f".into(),
+            };
+            SkillService::write_targeted_blob(&entry, &bytes, &source).unwrap();
+            assert_eq!(
+                fs::metadata(source.join(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                expected,
+                "downloaded {path}"
+            );
+        }
+        for existing in [false, true] {
+            let dest = temp.path().join(if existing { "existing" } else { "new" });
+            if existing {
+                for (path, _, expected) in files {
+                    let file = dest.join(path);
+                    fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    // Identical content with opposite execute bits exercises
+                    // permission-only updates in both directions.
+                    fs::write(&file, &bytes).unwrap();
+                    fs::set_permissions(&file, fs::Permissions::from_mode(expected ^ 0o111))
+                        .unwrap();
+                }
+            }
+            let mut update = in_place::Update::prepare(&source, &dest).unwrap();
+            update.apply().unwrap();
+            update.commit().unwrap();
+            for (path, _, expected) in files {
+                let file = dest.join(path);
+                assert_eq!(fs::read(&file).unwrap(), bytes);
+                assert_eq!(
+                    fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+                    expected,
+                    "deployed {path}, existing={existing}"
+                );
+            }
+        }
     }
     #[tokio::test]
     async fn targeted_download_tests_real_http_rejects_oversize_and_hash_before_writing() {
