@@ -848,7 +848,7 @@ mod archive_capacity_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial(home_settings)]
+    #[serial_test::serial(home_settings)]
     async fn archive_capacity_update_check_respects_git_executable_modes() {
         use std::os::unix::fs::PermissionsExt;
 
