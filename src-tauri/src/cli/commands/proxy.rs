@@ -33,6 +33,24 @@ pub enum ProxyCommand {
         /// Set the selected app's daemon worker listen port
         #[arg(long)]
         listen_port: Option<u16>,
+
+        /// Restore only the persisted enabled flag, without starting a proxy session
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            requires = "expected_enabled",
+            conflicts_with_all = ["listen_address", "listen_port"]
+        )]
+        restore_enabled: Option<bool>,
+
+        /// Require the persisted enabled flag to match this value before restoring it
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            requires = "restore_enabled",
+            conflicts_with_all = ["listen_address", "listen_port"]
+        )]
+        expected_enabled: Option<bool>,
     },
 
     /// Start the local proxy in the foreground for debugging
@@ -60,7 +78,18 @@ pub fn execute(cmd: ProxyCommand, app: Option<AppType>) -> Result<(), AppError> 
         ProxyCommand::Config {
             listen_address,
             listen_port,
-        } => configure_proxy(app_type, listen_address, listen_port),
+            restore_enabled,
+            expected_enabled,
+        } => match (restore_enabled, expected_enabled) {
+            (Some(enabled), Some(expected)) if listen_address.is_none() && listen_port.is_none() => {
+                restore_proxy_enabled(app_type, enabled, expected)
+            }
+            (None, None) => configure_proxy(app_type, listen_address, listen_port),
+            _ => Err(AppError::InvalidInput(
+                "restore-enabled and expected-enabled must be provided together, without listen options"
+                    .to_string(),
+            )),
+        },
         ProxyCommand::Serve {
             listen_address,
             listen_port,
@@ -129,6 +158,34 @@ fn set_proxy_enabled(app_type: AppType, enabled: bool) -> Result<(), AppError> {
         ))
     );
 
+    Ok(())
+}
+
+fn restore_proxy_enabled(
+    app_type: AppType,
+    enabled: bool,
+    expected_enabled: bool,
+) -> Result<(), AppError> {
+    if !matches!(app_type, AppType::Claude | AppType::Codex | AppType::Gemini) {
+        return Err(AppError::InvalidInput(format!(
+            "proxy flag restoration is not supported for {}",
+            app_type.as_str()
+        )));
+    }
+    // Use an existing database directly: AppState initialization can migrate
+    // providers or recover live takeover configuration before this CAS runs.
+    let db = crate::Database::open_existing_current_schema()?;
+    db.restore_proxy_enabled_if_expected(app_type.as_str(), expected_enabled, enabled)?;
+    println!(
+        "{}",
+        success(&format!(
+            "{} {}: {} -> {}",
+            crate::t!("Persisted proxy flag restored", "已恢复持久化代理标志"),
+            app_type.as_str(),
+            expected_enabled,
+            enabled
+        ))
+    );
     Ok(())
 }
 
@@ -673,6 +730,21 @@ fn build_auto_failover_status_lines(state: &AppState) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn proxy_flag_restore_rejects_unsupported_apps_before_database_access() {
+        for app in [
+            crate::app_config::AppType::OpenCode,
+            crate::app_config::AppType::Hermes,
+            crate::app_config::AppType::OpenClaw,
+            crate::app_config::AppType::Pi,
+        ] {
+            assert!(matches!(
+                super::restore_proxy_enabled(app, true, false),
+                Err(crate::error::AppError::InvalidInput(_))
+            ));
+        }
+    }
 
     use crate::{
         proxy::types::{ActiveWorker, ProxyStatus, ProxyTakeoverStatus},

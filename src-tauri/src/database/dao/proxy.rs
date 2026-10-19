@@ -1218,6 +1218,43 @@ impl Database {
         .unwrap_or((false, false))
     }
 
+    /// Restore only an existing app's persisted enabled flag with a CAS guard.
+    /// This does not reconcile failover, providers, live configuration, or services.
+    pub fn restore_proxy_enabled_if_expected(
+        &self,
+        app_type: &str,
+        expected_enabled: bool,
+        enabled: bool,
+    ) -> Result<(), AppError> {
+        if !matches!(app_type, "claude" | "codex" | "gemini") {
+            return Err(AppError::InvalidInput(format!(
+                "proxy flag restoration is not supported for {app_type}"
+            )));
+        }
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let changed = tx
+            .execute(
+                "UPDATE proxy_config
+                 SET enabled = ?3, updated_at = datetime('now')
+                 WHERE app_type = ?1 AND enabled = ?2",
+                rusqlite::params![
+                    app_type,
+                    if expected_enabled { 1 } else { 0 },
+                    if enabled { 1 } else { 0 },
+                ],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if changed != 1 {
+            return Err(AppError::InvalidInput(format!(
+                "proxy flag restoration rejected for {app_type}: expected enabled={expected_enabled} did not match an existing row"
+            )));
+        }
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))
+    }
+
     /// 同步设置应用的 proxy 启用状态和自动故障转移状态
     ///
     /// 用于托盘菜单点击等同步场景
@@ -1245,5 +1282,119 @@ impl Database {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod proxy_flag_restore_tests {
+    use super::*;
+    use rusqlite::types::Value;
+    use std::collections::BTreeMap;
+
+    type Snapshot = BTreeMap<String, (Vec<String>, Vec<Vec<Value>>)>;
+
+    fn snapshot(db: &Database) -> Snapshot {
+        let conn = db.conn.lock().expect("database connection");
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .expect("table query")
+            .query_map([], |row| row.get(0))
+            .expect("query tables")
+            .collect::<Result<_, _>>()
+            .expect("table names");
+        tables
+            .into_iter()
+            .map(|table| {
+                let sql = format!("SELECT * FROM \"{}\" ORDER BY rowid", table.replace('"', "\"\""));
+                let mut stmt = conn.prepare(&sql).expect("snapshot table");
+                let columns: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+                let rows = stmt
+                    .query_map([], |row| {
+                        (0..columns.len())
+                            .map(|index| row.get(index))
+                            .collect::<Result<Vec<Value>, _>>()
+                    })
+                    .expect("snapshot query")
+                    .collect::<Result<_, _>>()
+                    .expect("snapshot rows");
+                (table, (columns, rows))
+            })
+            .collect()
+    }
+
+    fn seeded_database() -> Database {
+        let db = Database::memory().expect("memory database");
+        {
+            let conn = db.conn.lock().expect("database connection");
+            conn.execute_batch(
+                "UPDATE proxy_config SET proxy_enabled = 1, listen_address = 'localhost',
+                 listen_port = 18080, enable_logging = 0, enabled = 0,
+                 auto_failover_enabled = 1, max_retries = 9,
+                 default_cost_multiplier = '1.7', updated_at = '2000-01-01 00:00:00';
+                 INSERT INTO providers (id, app_type, name, settings_config, is_current)
+                 VALUES ('provider-fixture', 'codex', 'Fixture', '{\"token\":\"test-only\"}', 1);
+                 INSERT INTO mcp_servers (id, name, server_config, enabled_codex)
+                 VALUES ('mcp-fixture', 'Fixture', '{\"command\":\"fixture\"}', 1);
+                 INSERT INTO settings (key, value) VALUES ('flag-restore-fixture', 'unchanged');"
+            )
+            .expect("seed fixtures");
+        }
+        db
+    }
+
+    #[test]
+    fn proxy_flag_restore_changes_only_target_enabled_and_updated_at() {
+        let db = seeded_database();
+        let mut before = snapshot(&db);
+        db.restore_proxy_enabled_if_expected("codex", false, true)
+            .expect("restore expected flag");
+        let after = snapshot(&db);
+        let (columns, rows) = before.get_mut("proxy_config").expect("proxy snapshot");
+        let app_index = columns.iter().position(|name| name == "app_type").unwrap();
+        let enabled_index = columns.iter().position(|name| name == "enabled").unwrap();
+        let updated_index = columns.iter().position(|name| name == "updated_at").unwrap();
+        let old_row = rows.iter_mut().find(|row| row[app_index] == Value::Text("codex".into())).unwrap();
+        let new_row = after["proxy_config"].1.iter().find(|row| row[app_index] == Value::Text("codex".into())).unwrap();
+        assert_eq!(new_row[enabled_index], Value::Integer(1));
+        assert_ne!(new_row[updated_index], old_row[updated_index]);
+        old_row[enabled_index] = new_row[enabled_index].clone();
+        old_row[updated_index] = new_row[updated_index].clone();
+        assert_eq!(before, after, "every other database value must remain unchanged");
+    }
+
+    #[test]
+    fn proxy_flag_restore_rejects_stale_expected_without_writes() {
+        let db = seeded_database();
+        let before = snapshot(&db);
+        let total_changes = || {
+            db.conn.lock().unwrap()
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .expect("read change count")
+        };
+        let changes_before = total_changes();
+        assert!(matches!(
+            db.restore_proxy_enabled_if_expected("codex", true, true),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert_eq!(snapshot(&db), before);
+        assert_eq!(total_changes(), changes_before);
+    }
+
+    #[test]
+    fn proxy_flag_restore_rejects_unsupported_or_missing_app_without_writes() {
+        let db = seeded_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DELETE FROM proxy_config WHERE app_type = 'gemini'", [])
+                .expect("remove fixture row");
+        }
+        let before = snapshot(&db);
+        for app in ["grokbuild", "opencode", "gemini"] {
+            assert!(matches!(
+                db.restore_proxy_enabled_if_expected(app, false, true),
+                Err(AppError::InvalidInput(_))
+            ));
+        }
+        assert_eq!(snapshot(&db), before);
     }
 }

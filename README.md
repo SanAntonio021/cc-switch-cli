@@ -1,5 +1,15 @@
 ![CC-Switch CLI — one switchboard for every AI CLI](assets/screenshots/hero.png)
 
+> Maintenance fork: [SanAntonio021/cc-switch-cli](https://github.com/SanAntonio021/cc-switch-cli).
+> Based on upstream `v5.11.2` (`b03e725823e8d6d8569db710dada64a728559ea8`).
+> This branch adds commit-pinned skill downloads, local-directory publication,
+> file transactions, larger archive budgets, and publication startup isolation.
+> Database schema v20 is provided by upstream; no local schema extension is applied.
+> Build from `src-tauri/` with Rust 1.91.1. The Windows package targets
+> `x86_64-pc-windows-msvc` with `RUSTFLAGS="-C target-feature=+crt-static"`.
+> Package `SOURCE.json` records the exact upstream, patches, and build commit.
+
+
 <div align="center">
 
 ## CC-Switch CLI
