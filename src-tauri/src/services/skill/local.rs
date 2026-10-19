@@ -278,7 +278,8 @@ impl SkillService {
             .unwrap_or_else(|| SkillApps::only(app));
         let mut destinations = vec![ssot.clone()];
         for target in Self::supported_skill_apps().filter(|a| apps.is_enabled_for(a)) {
-            let dest = Self::get_app_skills_dir(&target)?.join(name);
+            let dest =
+                Self::get_distinct_app_skills_dir(&Self::get_ssot_dir()?, &target)?.join(name);
             if Self::is_symlink(&dest) {
                 if existing.is_some()
                     && fs::canonicalize(&dest).ok() == fs::canonicalize(&ssot).ok()
@@ -462,6 +463,30 @@ mod tests {
         .to_string()
         .contains("Foreign"));
         assert_eq!(proxy_flags(), before);
+    }
+
+    #[test]
+    fn local_install_rejects_app_directory_inside_another_skill() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::TestEnvGuard::isolated(home.path());
+        let input = source(home.path(), "first");
+        let ssot = SkillService::get_ssot_dir().unwrap();
+        let other = ssot.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("SKILL.md"), "other skill must remain intact").unwrap();
+        let before = local_tree_hash(&other).unwrap();
+        let mut settings = crate::settings::get_settings();
+        settings.codex_config_dir = Some(other.to_string_lossy().into_owned());
+        crate::settings::update_settings(settings).unwrap();
+
+        assert!(install(&input, 'a')
+            .unwrap_err()
+            .to_string()
+            .contains("cannot overlap"));
+        assert_eq!(local_tree_hash(&other).unwrap(), before);
+        assert!(!other.join("skills").exists());
+        assert!(!ssot.join("demo").exists());
+        assert_eq!(SkillService::local_info("demo").unwrap()["found"], false);
     }
 
     #[test]
