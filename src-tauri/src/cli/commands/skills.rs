@@ -15,6 +15,9 @@ use crate::services::SkillService;
 pub enum SkillsCommand {
     /// Install/update a provenance-bound local directory (offline, managed only).
     InstallLocal {
+        /// Exact skill-relative local file to preserve without reading (repeatable).
+        #[arg(long = "runtime-file", value_name = "RELATIVE_FILE")]
+        runtime_files: Vec<String>,
         #[arg(long)]
         source_dir: std::path::PathBuf,
         #[arg(long)]
@@ -67,6 +70,9 @@ pub enum SkillsCommand {
     CheckUpdates,
     /// Manually update one repository-backed skill or every detected update
     Update {
+        /// Exact local file to preserve; requires a single commit-pinned update.
+        #[arg(long = "runtime-file", value_name = "RELATIVE_FILE", requires = "source_commit", conflicts_with = "all")]
+        runtime_files: Vec<String>,
         /// Installed skill directory or id
         #[arg(
             value_name = "SPEC",
@@ -181,6 +187,7 @@ pub fn execute(cmd: SkillsCommand, app: Option<AppType>) -> Result<(), AppError>
 
     match cmd {
         SkillsCommand::InstallLocal {
+            runtime_files,
             source_dir,
             name,
             source_repo,
@@ -188,13 +195,14 @@ pub fn execute(cmd: SkillsCommand, app: Option<AppType>) -> Result<(), AppError>
             source_commit,
             json: _,
         } => {
-            let result = SkillService::install_local(
+            let result = SkillService::install_local_with_runtime_files(
                 &source_dir,
                 &name,
                 &source_repo,
                 &source_path,
                 &source_commit,
                 &app.clone().unwrap_or(AppType::Codex),
+                &runtime_files,
             )?;
             println!("{}", result);
             Ok(())
@@ -216,10 +224,11 @@ pub fn execute(cmd: SkillsCommand, app: Option<AppType>) -> Result<(), AppError>
         } => install_skill(&app_type, &spec, source_commit.as_deref()),
         SkillsCommand::CheckUpdates => check_skill_updates(),
         SkillsCommand::Update {
+            runtime_files,
             spec,
             all,
             source_commit,
-        } => update_skills(spec.as_deref(), all, source_commit.as_deref()),
+        } => update_skills(spec.as_deref(), all, source_commit.as_deref(), &runtime_files),
         SkillsCommand::Uninstall { spec } => uninstall_skill(&spec),
         SkillsCommand::Enable { spec, apps } => toggle_skill(&app_type, &spec, &apps, true),
         SkillsCommand::Disable { spec, apps } => toggle_skill(&app_type, &spec, &apps, false),
@@ -398,6 +407,7 @@ fn update_skills(
     spec: Option<&str>,
     all: bool,
     source_commit: Option<&str>,
+    runtime_files: &[String],
 ) -> Result<(), AppError> {
     let service = SkillService::new()?;
     let mut check_failures = Vec::new();
@@ -435,7 +445,7 @@ fn update_skills(
     }
 
     let batch =
-        run_async(async { Ok(service.update_skills_at_commit(&ids, source_commit).await) })?;
+        run_async(async { Ok(service.update_skills_at_commit_with_runtime_files(&ids, source_commit, runtime_files).await) })?;
     if !batch.updated.is_empty() {
         println!(
             "{}",
