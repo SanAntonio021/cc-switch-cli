@@ -71,7 +71,12 @@ pub enum SkillsCommand {
     /// Manually update one repository-backed skill or every detected update
     Update {
         /// Exact local file to preserve; requires a single commit-pinned update.
-        #[arg(long = "runtime-file", value_name = "RELATIVE_FILE", requires = "source_commit", conflicts_with = "all")]
+        #[arg(
+            long = "runtime-file",
+            value_name = "RELATIVE_FILE",
+            requires = "source_commit",
+            conflicts_with = "all"
+        )]
         runtime_files: Vec<String>,
         /// Installed skill directory or id
         #[arg(
@@ -228,7 +233,12 @@ pub fn execute(cmd: SkillsCommand, app: Option<AppType>) -> Result<(), AppError>
             spec,
             all,
             source_commit,
-        } => update_skills(spec.as_deref(), all, source_commit.as_deref(), &runtime_files),
+        } => update_skills(
+            spec.as_deref(),
+            all,
+            source_commit.as_deref(),
+            &runtime_files,
+        ),
         SkillsCommand::Uninstall { spec } => uninstall_skill(&spec),
         SkillsCommand::Enable { spec, apps } => toggle_skill(&app_type, &spec, &apps, true),
         SkillsCommand::Disable { spec, apps } => toggle_skill(&app_type, &spec, &apps, false),
@@ -444,8 +454,11 @@ fn update_skills(
         )));
     }
 
-    let batch =
-        run_async(async { Ok(service.update_skills_at_commit_with_runtime_files(&ids, source_commit, runtime_files).await) })?;
+    let batch = run_async(async {
+        Ok(service
+            .update_skills_at_commit_with_runtime_files(&ids, source_commit, runtime_files)
+            .await)
+    })?;
     if !batch.updated.is_empty() {
         println!(
             "{}",

@@ -2070,24 +2070,57 @@ mod tests {
     #[test]
     fn runtime_files_require_single_pinned_update_and_accept_repeated_paths() {
         assert!(Cli::try_parse_from([
-            "cc-switch", "skills", "update", "hello", "--runtime-file", "local.json",
-        ]).is_err());
+            "cc-switch",
+            "skills",
+            "update",
+            "hello",
+            "--runtime-file",
+            "local.json",
+        ])
+        .is_err());
         let commit = "a".repeat(40);
         let parsed = Cli::parse_from([
-            "cc-switch", "skills", "update", "hello", "--source-commit", &commit,
-            "--runtime-file", "local.json", "--runtime-file", "config/private.json",
+            "cc-switch",
+            "skills",
+            "update",
+            "hello",
+            "--source-commit",
+            &commit,
+            "--runtime-file",
+            "local.json",
+            "--runtime-file",
+            "config/private.json",
         ]);
         assert!(matches!(parsed.command, Some(Commands::Skills(
             super::commands::skills::SkillsCommand::Update { runtime_files, .. }
         )) if runtime_files == ["local.json", "config/private.json"]));
         assert!(Cli::try_parse_from([
-            "cc-switch", "skills", "update", "--all", "--source-commit", &commit,
-            "--runtime-file", "local.json",
-        ]).is_err());
+            "cc-switch",
+            "skills",
+            "update",
+            "--all",
+            "--source-commit",
+            &commit,
+            "--runtime-file",
+            "local.json",
+        ])
+        .is_err());
         let local = Cli::parse_from([
-            "cc-switch", "skills", "install-local", "--source-dir", "export",
-            "--name", "demo", "--source-repo", "owner/private", "--source-path", "skills/demo",
-            "--source-commit", &commit, "--runtime-file", "local.json",
+            "cc-switch",
+            "skills",
+            "install-local",
+            "--source-dir",
+            "export",
+            "--name",
+            "demo",
+            "--source-repo",
+            "owner/private",
+            "--source-path",
+            "skills/demo",
+            "--source-commit",
+            &commit,
+            "--runtime-file",
+            "local.json",
         ]);
         assert!(matches!(local.command, Some(Commands::Skills(
             super::commands::skills::SkillsCommand::InstallLocal { runtime_files, .. }

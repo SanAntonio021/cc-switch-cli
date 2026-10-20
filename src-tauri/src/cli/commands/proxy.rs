@@ -836,8 +836,7 @@ mod tests {
             "proxy show output should include foreground runtime status"
         );
         assert!(
-            output.contains("Listen address: 127.0.0.1")
-                || output.contains("监听地址: 127.0.0.1"),
+            output.contains("Listen address: 127.0.0.1") || output.contains("监听地址: 127.0.0.1"),
             "proxy show output should show the active runtime listen address separately from app ports"
         );
         assert!(

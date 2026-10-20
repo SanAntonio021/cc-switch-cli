@@ -1118,10 +1118,18 @@ impl SkillService {
         Self::compute_pi_deployment_hash_with_runtime(dir, &runtime_files::RuntimeFiles::none())
     }
 
-    fn compute_pi_deployment_hash_with_runtime(dir: &Path, runtime: &runtime_files::RuntimeFiles) -> Result<String, AppError> {
+    fn compute_pi_deployment_hash_with_runtime(
+        dir: &Path,
+        runtime: &runtime_files::RuntimeFiles,
+    ) -> Result<String, AppError> {
         use sha2::{Digest, Sha256};
 
-        fn collect(current: &Path, root: &Path, entries: &mut Vec<PathBuf>, runtime: &runtime_files::RuntimeFiles) -> Result<bool, AppError> {
+        fn collect(
+            current: &Path,
+            root: &Path,
+            entries: &mut Vec<PathBuf>,
+            runtime: &runtime_files::RuntimeFiles,
+        ) -> Result<bool, AppError> {
             let mut had_children = false;
             let mut managed_children = false;
             for entry in fs::read_dir(current).map_err(|error| AppError::io(current, error))? {
@@ -1133,7 +1141,9 @@ impl SkillService {
                     .map_err(|error| AppError::io(&path, error))?;
                 if runtime.contains(path.strip_prefix(root).expect("descendant")) {
                     if !file_type.is_file() {
-                        return Err(AppError::InvalidInput("Runtime path must be a regular file".into()));
+                        return Err(AppError::InvalidInput(
+                            "Runtime path must be a regular file".into(),
+                        ));
                     }
                     continue;
                 }
@@ -2377,10 +2387,18 @@ impl SkillService {
         Self::compute_dir_hash_with_runtime(dir, &runtime_files::RuntimeFiles::none())
     }
 
-    fn compute_dir_hash_with_runtime(dir: &Path, runtime: &runtime_files::RuntimeFiles) -> Result<String, AppError> {
+    fn compute_dir_hash_with_runtime(
+        dir: &Path,
+        runtime: &runtime_files::RuntimeFiles,
+    ) -> Result<String, AppError> {
         use sha2::{Digest, Sha256};
 
-        fn collect(current: &Path, root: &Path, files: &mut Vec<PathBuf>, runtime: &runtime_files::RuntimeFiles) -> Result<(), AppError> {
+        fn collect(
+            current: &Path,
+            root: &Path,
+            files: &mut Vec<PathBuf>,
+            runtime: &runtime_files::RuntimeFiles,
+        ) -> Result<(), AppError> {
             for entry in fs::read_dir(current).map_err(|e| AppError::io(current, e))? {
                 let entry = entry.map_err(|e| AppError::io(current, e))?;
                 let name = entry.file_name();
@@ -2770,7 +2788,7 @@ impl SkillService {
             _ => {
                 return Err(AppError::InvalidInput(format!(
                     "Cannot update local Skill: {skill_id}"
-                )))
+                )));
             }
         };
         let repo = SkillRepo {
@@ -2864,7 +2882,9 @@ impl SkillService {
             ));
             updated.content_hash = Some(local::local_tree_hash_with_runtime(&source, runtime)?);
             updated.updated_at = Utc::now().timestamp();
-            return Self::publish_pinned_update_with_runtime(&db, &source, &current, updated, runtime);
+            return Self::publish_pinned_update_with_runtime(
+                &db, &source, &current, updated, runtime,
+            );
         }
         let pi_deployment = if current.apps.pi {
             let pi_dir = Self::get_distinct_app_skills_dir(&ssot_dir, &AppType::Pi)?;
@@ -2961,11 +2981,20 @@ impl SkillService {
         current: &InstalledSkill,
         updated: InstalledSkill,
     ) -> Result<SkillUpdateOutcome, AppError> {
-        Self::publish_pinned_update_with_runtime(db, source, current, updated, &runtime_files::RuntimeFiles::default())
+        Self::publish_pinned_update_with_runtime(
+            db,
+            source,
+            current,
+            updated,
+            &runtime_files::RuntimeFiles::default(),
+        )
     }
 
     fn publish_pinned_update_with_runtime(
-        db: &Database, source: &Path, current: &InstalledSkill, updated: InstalledSkill,
+        db: &Database,
+        source: &Path,
+        current: &InstalledSkill,
+        updated: InstalledSkill,
         runtime: &runtime_files::RuntimeFiles,
     ) -> Result<SkillUpdateOutcome, AppError> {
         runtime.validate_source(source)?;
@@ -3079,11 +3108,20 @@ impl SkillService {
         })
     }
 
-    fn require_legacy_hidden_unchanged_with_runtime(current: &Path, source: &Path, runtime: &runtime_files::RuntimeFiles) -> Result<(), AppError> {
+    fn require_legacy_hidden_unchanged_with_runtime(
+        current: &Path,
+        source: &Path,
+        runtime: &runtime_files::RuntimeFiles,
+    ) -> Result<(), AppError> {
         Self::require_legacy_hidden_at(current, source, current, runtime)
     }
 
-    fn require_legacy_hidden_at(current: &Path, source: &Path, root: &Path, runtime: &runtime_files::RuntimeFiles) -> Result<(), AppError> {
+    fn require_legacy_hidden_at(
+        current: &Path,
+        source: &Path,
+        root: &Path,
+        runtime: &runtime_files::RuntimeFiles,
+    ) -> Result<(), AppError> {
         for entry in fs::read_dir(current).map_err(|e| AppError::io(current, e))? {
             let entry = entry.map_err(|e| AppError::io(current, e))?;
             let path = entry.path();
@@ -3094,12 +3132,19 @@ impl SkillService {
             let kind = entry.file_type().map_err(|e| AppError::io(&path, e))?;
             if entry.file_name().to_string_lossy().starts_with('.') {
                 let unchanged = if kind.is_dir() && next.is_dir() {
-                    local::local_tree_hash_with_runtime(&path, &runtime.scoped(path.strip_prefix(root).expect("descendant")))?
-                        == local::local_tree_hash_with_runtime(&next, &runtime.scoped(path.strip_prefix(root).expect("descendant")))?
+                    local::local_tree_hash_with_runtime(
+                        &path,
+                        &runtime.scoped(path.strip_prefix(root).expect("descendant")),
+                    )? == local::local_tree_hash_with_runtime(
+                        &next,
+                        &runtime.scoped(path.strip_prefix(root).expect("descendant")),
+                    )?
                 } else if kind.is_dir() && !next.exists() {
                     // Directories containing only excluded files are not source content.
-                    local::local_tree_hash_with_runtime(&path, &runtime.scoped(path.strip_prefix(root).expect("descendant")))?
-                        == "local-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    local::local_tree_hash_with_runtime(
+                        &path,
+                        &runtime.scoped(path.strip_prefix(root).expect("descendant")),
+                    )? == "local-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                 } else if kind.is_file() && next.is_file() {
                     fs::read(&path).map_err(|e| AppError::io(&path, e))?
                         == fs::read(&next).map_err(|e| AppError::io(&next, e))?
@@ -3128,21 +3173,35 @@ impl SkillService {
         ids: &[String],
         source_commit: Option<&str>,
     ) -> SkillUpdateBatchResult {
-        self.update_skills_at_commit_with_runtime_files(ids, source_commit, &[]).await
+        self.update_skills_at_commit_with_runtime_files(ids, source_commit, &[])
+            .await
     }
 
     pub async fn update_skills_at_commit_with_runtime_files(
-        &self, ids: &[String], source_commit: Option<&str>, runtime_files: &[String],
+        &self,
+        ids: &[String],
+        source_commit: Option<&str>,
+        runtime_files: &[String],
     ) -> SkillUpdateBatchResult {
         let mut result = SkillUpdateBatchResult::default();
         let runtime = match runtime_files::RuntimeFiles::new(runtime_files) {
-            Ok(runtime) if runtime_files.is_empty() || (source_commit.is_some() && ids.len() == 1) => runtime,
+            Ok(runtime)
+                if runtime_files.is_empty() || (source_commit.is_some() && ids.len() == 1) =>
+            {
+                runtime
+            }
             Ok(_) => {
-                result.failures.push(SkillUpdateFailure { id: ids.join(","), error: "Runtime files require one commit-pinned update".into() });
+                result.failures.push(SkillUpdateFailure {
+                    id: ids.join(","),
+                    error: "Runtime files require one commit-pinned update".into(),
+                });
                 return result;
             }
             Err(error) => {
-                result.failures.push(SkillUpdateFailure { id: ids.join(","), error: error.to_string() });
+                result.failures.push(SkillUpdateFailure {
+                    id: ids.join(","),
+                    error: error.to_string(),
+                });
                 return result;
             }
         };
@@ -3392,10 +3451,12 @@ impl SkillService {
                 match fs::remove_dir(&dir) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(cleanup) => return Err(AppError::Message(format!(
-                        "Pinned install failed ({error}); file rollback verified; empty directory cleanup failed ({}: {cleanup}); recovery journal retained",
-                        dir.display()
-                    ))),
+                    Err(cleanup) => {
+                        return Err(AppError::Message(format!(
+                            "Pinned install failed ({error}); file rollback verified; empty directory cleanup failed ({}: {cleanup}); recovery journal retained",
+                            dir.display()
+                        )));
+                    }
                 }
             }
             if let Err(cleanup) = update.commit() {
@@ -4325,11 +4386,13 @@ mod tests {
     }
 
     fn assert_no_pinned_staging(ssot: &Path) {
-        assert!(fs::read_dir(ssot).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".skill-in-place-")));
+        assert!(fs::read_dir(ssot).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".skill-in-place-")
+        }));
     }
 
     #[test]
@@ -4345,17 +4408,39 @@ mod tests {
             fs::write(dest.join("local.json"), format!("secret-{i}")).unwrap();
         }
         db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_runtime BEFORE UPDATE ON skills BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
-        let error = SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated.clone(), &runtime).err().unwrap();
+        let error = SkillService::publish_pinned_update_with_runtime(
+            &db,
+            &source,
+            &current,
+            updated.clone(),
+            &runtime,
+        )
+        .err()
+        .unwrap();
         assert!(error.to_string().contains("rollback verified"), "{error}");
         for dest in &destinations {
             assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"old skill\n");
         }
-        db.conn.lock().unwrap().execute_batch("DROP TRIGGER fail_runtime;").unwrap();
-        SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated, &runtime).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_runtime;")
+            .unwrap();
+        SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated, &runtime)
+            .unwrap();
         for (i, dest) in destinations.iter().enumerate() {
-            assert_eq!(fs::read(dest.join("__pycache__/module.pyc")).unwrap(), [i as u8]);
-            assert_eq!(fs::read_to_string(dest.join("local.json")).unwrap(), format!("secret-{i}"));
-            assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), fs::read(source.join("SKILL.md")).unwrap());
+            assert_eq!(
+                fs::read(dest.join("__pycache__/module.pyc")).unwrap(),
+                [i as u8]
+            );
+            assert_eq!(
+                fs::read_to_string(dest.join("local.json")).unwrap(),
+                format!("secret-{i}")
+            );
+            assert_eq!(
+                fs::read(dest.join("SKILL.md")).unwrap(),
+                fs::read(source.join("SKILL.md")).unwrap()
+            );
         }
     }
 
@@ -4367,7 +4452,10 @@ mod tests {
         let (db, source, current, updated, destinations) = pinned_update_fixture(home.path());
         let runtime = runtime_files::RuntimeFiles::new(&["local.json".into()]).unwrap();
         fs::write(source.join("local.json"), "source conflict").unwrap();
-        assert!(SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated, &runtime).is_err());
+        assert!(SkillService::publish_pinned_update_with_runtime(
+            &db, &source, &current, updated, &runtime
+        )
+        .is_err());
         for dest in destinations {
             assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"old skill\n");
         }
@@ -4382,9 +4470,17 @@ mod tests {
             let (db, source, current, updated, destinations) = pinned_update_fixture(home.path());
             fs::create_dir_all(destinations[1].join("notes")).unwrap();
             fs::write(source.join("notes"), "cannot replace user directory").unwrap();
-            let paths = if explicit { vec!["local.json".into()] } else { Vec::new() };
+            let paths = if explicit {
+                vec!["local.json".into()]
+            } else {
+                Vec::new()
+            };
             let runtime = runtime_files::RuntimeFiles::new(&paths).unwrap();
-            let error = SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated, &runtime).err().unwrap();
+            let error = SkillService::publish_pinned_update_with_runtime(
+                &db, &source, &current, updated, &runtime,
+            )
+            .err()
+            .unwrap();
             assert!(error.to_string().contains("local edits"), "{error}");
             assert!(destinations[1].join("notes").is_dir());
             for dest in destinations {
@@ -4400,13 +4496,19 @@ mod tests {
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
         let (db, source, current, updated, destinations) = pinned_update_fixture(home.path());
         fs::create_dir_all(source.join("scripts/__pycache__")).unwrap();
-        fs::write(source.join("scripts/__pycache__/source.pyc"), "generated source cache").unwrap();
+        fs::write(
+            source.join("scripts/__pycache__/source.pyc"),
+            "generated source cache",
+        )
+        .unwrap();
         let cache = destinations[1].join("scripts/__pycache__/m.pyc");
         fs::create_dir_all(cache.parent().unwrap()).unwrap();
         fs::write(&cache, "cache").unwrap();
         SkillService::publish_pinned_update(&db, &source, &current, updated).unwrap();
         assert_eq!(fs::read(cache).unwrap(), b"cache");
-        assert!(!destinations[0].join("scripts/__pycache__/source.pyc").exists());
+        assert!(!destinations[0]
+            .join("scripts/__pycache__/source.pyc")
+            .exists());
     }
 
     #[test]
@@ -4423,8 +4525,14 @@ mod tests {
         db.save_skill(&current).unwrap();
         SkillService::publish_pinned_update(&db, &source, &current, updated).unwrap();
         for dest in destinations {
-            assert_eq!(fs::read(dest.join("__pycache__/module.pyc")).unwrap(), b"legacy cache");
-            assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), fs::read(source.join("SKILL.md")).unwrap());
+            assert_eq!(
+                fs::read(dest.join("__pycache__/module.pyc")).unwrap(),
+                b"legacy cache"
+            );
+            assert_eq!(
+                fs::read(dest.join("SKILL.md")).unwrap(),
+                fs::read(source.join("SKILL.md")).unwrap()
+            );
         }
     }
 
@@ -4443,9 +4551,13 @@ mod tests {
             fs::write(dest.join(".private/local.json"), "private").unwrap();
             fs::write(dest.join("__pycache__/m.pyc"), "cache").unwrap();
         }
-        SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated, &runtime).unwrap();
+        SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated, &runtime)
+            .unwrap();
         for dest in destinations {
-            assert_eq!(fs::read(dest.join(".private/local.json")).unwrap(), b"private");
+            assert_eq!(
+                fs::read(dest.join(".private/local.json")).unwrap(),
+                b"private"
+            );
         }
     }
 
@@ -4464,10 +4576,17 @@ mod tests {
                 let file = dest.join(relative);
                 fs::create_dir_all(file.parent().unwrap()).unwrap();
                 fs::write(&file, "private").unwrap();
-                handles.push(fs::OpenOptions::new().read(true).share_mode(0).open(file).unwrap());
+                handles.push(
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(file)
+                        .unwrap(),
+                );
             }
         }
-        SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated, &runtime).unwrap();
+        SkillService::publish_pinned_update_with_runtime(&db, &source, &current, updated, &runtime)
+            .unwrap();
         drop(handles);
     }
 
@@ -5232,7 +5351,10 @@ mod tests {
         let with_cache = SkillService::compute_dir_hash(temp.path()).unwrap();
         assert_ne!(before, with_cache);
         fs::write(temp.path().join("__pycache__/module.pyc"), "two").unwrap();
-        assert_ne!(with_cache, SkillService::compute_dir_hash(temp.path()).unwrap());
+        assert_ne!(
+            with_cache,
+            SkillService::compute_dir_hash(temp.path()).unwrap()
+        );
     }
 
     #[test]

@@ -569,7 +569,7 @@ impl SkillService {
                     return Err(AppError::InvalidInput(format!(
                         "Archive path is not a directory: {}",
                         current.display()
-                    )))
+                    )));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     Self::charge_archive_budget(
