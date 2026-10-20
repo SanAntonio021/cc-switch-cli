@@ -205,7 +205,7 @@ impl SkillService {
                 _ => {
                     return Err(failure(
                         "GitHub source contains a symlink, submodule or unsupported entry",
-                    ))
+                    ));
                 }
             };
             Self::charge_archive_budget(
@@ -224,7 +224,7 @@ impl SkillService {
                     _ => {
                         return Err(failure(
                             "Missing, colliding or non-directory Git path ancestor",
-                        ))
+                        ));
                     }
                 }
                 parent = path.parent();

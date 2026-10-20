@@ -258,10 +258,18 @@ fn inventory(root: &Path) -> Result<Inventory, AppError> {
     inventory_with_runtime(root, &super::runtime_files::RuntimeFiles::none())
 }
 
-fn inventory_with_runtime(root: &Path, runtime: &super::runtime_files::RuntimeFiles) -> Result<Inventory, AppError> {
+fn inventory_with_runtime(
+    root: &Path,
+    runtime: &super::runtime_files::RuntimeFiles,
+) -> Result<Inventory, AppError> {
     safe_path(root)?;
     let mut result = Inventory::default();
-    fn walk(root: &Path, path: &Path, result: &mut Inventory, runtime: &super::runtime_files::RuntimeFiles) -> Result<(), AppError> {
+    fn walk(
+        root: &Path,
+        path: &Path,
+        result: &mut Inventory,
+        runtime: &super::runtime_files::RuntimeFiles,
+    ) -> Result<(), AppError> {
         let Some(meta) = metadata(path)? else {
             return Err(error(path, "disappeared during inventory"));
         };
@@ -325,7 +333,12 @@ fn verify_state(
     files: &Files,
     permissions: &BTreeMap<PathBuf, fs::Permissions>,
 ) -> Result<(), AppError> {
-    verify_state_with_runtime(root, files, permissions, &super::runtime_files::RuntimeFiles::none())
+    verify_state_with_runtime(
+        root,
+        files,
+        permissions,
+        &super::runtime_files::RuntimeFiles::none(),
+    )
 }
 
 fn verify_state_with_runtime(
@@ -424,7 +437,11 @@ impl Update {
         Self::prepare_with_runtime(source, dest, &super::runtime_files::RuntimeFiles::none())
     }
 
-    pub(super) fn prepare_with_runtime(source: &Path, dest: &Path, runtime: &super::runtime_files::RuntimeFiles) -> Result<Self, AppError> {
+    pub(super) fn prepare_with_runtime(
+        source: &Path,
+        dest: &Path,
+        runtime: &super::runtime_files::RuntimeFiles,
+    ) -> Result<Self, AppError> {
         let source = absolute(source)?;
         let dest = absolute(dest)?;
         if metadata(&source)?.is_none() {
@@ -454,7 +471,10 @@ impl Update {
         let old = inventory_with_runtime(&dest, runtime)?;
         for path in &old.runtime_files {
             if path.ancestors().any(|p| next.files.contains_key(p)) {
-                return Err(error(&dest.join(path), "runtime file/source conversion conflict"));
+                return Err(error(
+                    &dest.join(path),
+                    "runtime file/source conversion conflict",
+                ));
             }
         }
         #[cfg(windows)]
@@ -467,7 +487,10 @@ impl Update {
             }) {
                 return Err(error(
                     &dest.join(runtime_path),
-                    format!("runtime file/source case conflict with {}", source_path.display()),
+                    format!(
+                        "runtime file/source case conflict with {}",
+                        source_path.display()
+                    ),
                 ));
             }
         }
@@ -713,7 +736,12 @@ impl Update {
     }
 
     fn apply_inner(&mut self) -> Result<(), AppError> {
-        verify_state_with_runtime(&self.dest, &self.before, &self.before_permissions, &self.runtime)?;
+        verify_state_with_runtime(
+            &self.dest,
+            &self.before,
+            &self.before_permissions,
+            &self.runtime,
+        )?;
         // Empty directory edits can also invalidate a planned conversion.
         if inventory_with_runtime(&self.dest, &self.runtime)?.dirs != self.before_dirs {
             return Err(error(&self.dest, "directory inventory conflict"));
@@ -780,7 +808,12 @@ impl Update {
             self.touched_operations.push(operation);
             self.journal("applying", mutated, Some(&relative))?;
         }
-        verify_state_with_runtime(&self.dest, &self.after, &self.after_permissions, &self.runtime)?;
+        verify_state_with_runtime(
+            &self.dest,
+            &self.after,
+            &self.after_permissions,
+            &self.runtime,
+        )?;
         self.journal("applied", "phase", None)
     }
 
@@ -874,7 +907,12 @@ impl Update {
                 failures.push(e.to_string());
             }
         }
-        if let Err(e) = verify_state_with_runtime(&self.dest, &self.before, &self.before_permissions, &self.runtime) {
+        if let Err(e) = verify_state_with_runtime(
+            &self.dest,
+            &self.before,
+            &self.before_permissions,
+            &self.runtime,
+        ) {
             failures.push(e.to_string());
         }
         for (relative, permissions) in &self.removed_dirs {
@@ -957,18 +995,26 @@ mod tests {
         fs::write(dest.join("SKILL.md"), "old").unwrap();
         fs::write(dest.join("local.json"), "private").unwrap();
         fs::write(dest.join("scripts/__pycache__/m.pyc"), "cache").unwrap();
-        let runtime = super::super::runtime_files::RuntimeFiles::new(&["local.json".into()]).unwrap();
+        let runtime =
+            super::super::runtime_files::RuntimeFiles::new(&["local.json".into()]).unwrap();
         let mut update = Update::prepare_with_runtime(&source, &dest, &runtime).unwrap();
         for staging in ["backup", "next"] {
             assert!(!update.stage.join(staging).join("local.json").exists());
-            assert!(!update.stage.join(staging).join("scripts/__pycache__/m.pyc").exists());
+            assert!(!update
+                .stage
+                .join(staging)
+                .join("scripts/__pycache__/m.pyc")
+                .exists());
         }
         update.apply().unwrap();
         update.rollback().unwrap();
         update.commit().unwrap();
         assert_eq!(fs::read(dest.join("SKILL.md")).unwrap(), b"old");
         assert_eq!(fs::read(dest.join("local.json")).unwrap(), b"private");
-        assert_eq!(fs::read(dest.join("scripts/__pycache__/m.pyc")).unwrap(), b"cache");
+        assert_eq!(
+            fs::read(dest.join("scripts/__pycache__/m.pyc")).unwrap(),
+            b"cache"
+        );
         fs::write(source.join("scripts"), "cannot replace cache ancestor").unwrap();
         assert!(Update::prepare_with_runtime(&source, &dest, &runtime).is_err());
     }

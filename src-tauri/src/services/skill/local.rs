@@ -80,15 +80,26 @@ pub(super) fn local_tree_hash(root: &Path) -> Result<String, AppError> {
     local_tree_hash_with_runtime(root, &runtime_files::RuntimeFiles::none())
 }
 
-pub(super) fn local_tree_hash_with_runtime(root: &Path, runtime: &runtime_files::RuntimeFiles) -> Result<String, AppError> {
+pub(super) fn local_tree_hash_with_runtime(
+    root: &Path,
+    runtime: &runtime_files::RuntimeFiles,
+) -> Result<String, AppError> {
     use sha2::{Digest, Sha256};
     let root = in_place::managed_path(root)?;
     let root = root.as_path();
-    fn collect(root: &Path, base: &Path, files: &mut Vec<PathBuf>, runtime: &runtime_files::RuntimeFiles) -> Result<(), AppError> {
+    fn collect(
+        root: &Path,
+        base: &Path,
+        files: &mut Vec<PathBuf>,
+        runtime: &runtime_files::RuntimeFiles,
+    ) -> Result<(), AppError> {
         for entry in fs::read_dir(root).map_err(|e| AppError::io(root, e))? {
             let path = entry.map_err(|e| AppError::io(root, e))?.path();
             if runtime.contains(path.strip_prefix(base).expect("descendant")) {
-                if !fs::symlink_metadata(&path).map_err(|e| AppError::io(&path, e))?.is_file() {
+                if !fs::symlink_metadata(&path)
+                    .map_err(|e| AppError::io(&path, e))?
+                    .is_file()
+                {
                     return Err(invalid("Runtime path must be a regular file"));
                 }
                 continue;
@@ -236,11 +247,25 @@ impl SkillService {
     }
 
     pub fn install_local_with_runtime_files(
-        source: &Path, name: &str, repo: &str, path: &str, commit: &str,
-        app: &AppType, runtime_files: &[String],
+        source: &Path,
+        name: &str,
+        repo: &str,
+        path: &str,
+        commit: &str,
+        app: &AppType,
+        runtime_files: &[String],
     ) -> Result<Value, AppError> {
         let runtime = runtime_files::RuntimeFiles::new(runtime_files)?;
-        Self::install_local_checked_with_runtime(source, name, repo, path, commit, app, &runtime, |_| Ok(()))
+        Self::install_local_checked_with_runtime(
+            source,
+            name,
+            repo,
+            path,
+            commit,
+            app,
+            &runtime,
+            |_| Ok(()),
+        )
     }
 
     fn install_local_checked<F: FnOnce(&Database) -> Result<(), AppError>>(
@@ -252,12 +277,27 @@ impl SkillService {
         app: &AppType,
         before_save: F,
     ) -> Result<Value, AppError> {
-        Self::install_local_checked_with_runtime(source, name, repo, path, commit, app, &runtime_files::RuntimeFiles::default(), before_save)
+        Self::install_local_checked_with_runtime(
+            source,
+            name,
+            repo,
+            path,
+            commit,
+            app,
+            &runtime_files::RuntimeFiles::default(),
+            before_save,
+        )
     }
 
     fn install_local_checked_with_runtime<F: FnOnce(&Database) -> Result<(), AppError>>(
-        source: &Path, name: &str, repo: &str, path: &str, commit: &str,
-        app: &AppType, runtime: &runtime_files::RuntimeFiles, before_save: F,
+        source: &Path,
+        name: &str,
+        repo: &str,
+        path: &str,
+        commit: &str,
+        app: &AppType,
+        runtime: &runtime_files::RuntimeFiles,
+        before_save: F,
     ) -> Result<Value, AppError> {
         if !matches!(app, AppType::Codex) {
             return Err(invalid("Local installation defaults must target codex"));
@@ -320,7 +360,11 @@ impl SkillService {
             require_file_empty_target(&ssot, "Unmanaged SSOT directory conflict")?;
         }
         if let Some(old) = &existing {
-            if !matches_baseline(&ssot, old.content_hash.as_deref().unwrap_or_default(), runtime)? {
+            if !matches_baseline(
+                &ssot,
+                old.content_hash.as_deref().unwrap_or_default(),
+                runtime,
+            )? {
                 return Err(invalid("Installed SSOT has local edits; refusing update"));
             }
         }
@@ -349,7 +393,11 @@ impl SkillService {
             }
             if let Some(old) = &existing {
                 if dest.exists() {
-                    if !matches_baseline(&dest, old.content_hash.as_deref().unwrap_or_default(), runtime)? {
+                    if !matches_baseline(
+                        &dest,
+                        old.content_hash.as_deref().unwrap_or_default(),
+                        runtime,
+                    )? {
                         return Err(invalid(
                             "Application skill has local edits; refusing update",
                         ));
@@ -452,28 +500,50 @@ mod tests {
         install(&input, 'a').unwrap();
         let targets = [
             SkillService::get_ssot_dir().unwrap().join("demo"),
-            SkillService::get_app_skills_dir(&AppType::Codex).unwrap().join("demo"),
+            SkillService::get_app_skills_dir(&AppType::Codex)
+                .unwrap()
+                .join("demo"),
         ];
         for (i, target) in targets.iter().enumerate() {
             fs::create_dir_all(target.join("scripts/__pycache__")).unwrap();
             fs::write(target.join("scripts/__pycache__/module.pyc"), [i as u8]).unwrap();
             fs::write(target.join("local.json"), format!("secret-{i}")).unwrap();
         }
-        let publish = || SkillService::install_local_with_runtime_files(
-            &input, "demo", "owner/private", "private-skills/demo", &"b".repeat(40),
-            &AppType::Codex, &["local.json".into()],
-        );
+        let publish = || {
+            SkillService::install_local_with_runtime_files(
+                &input,
+                "demo",
+                "owner/private",
+                "private-skills/demo",
+                &"b".repeat(40),
+                &AppType::Codex,
+                &["local.json".into()],
+            )
+        };
         source(home.path(), "second");
         assert_eq!(publish().unwrap()["action"], "updated");
         for (i, target) in targets.iter().enumerate() {
-            assert_eq!(fs::read(target.join("scripts/__pycache__/module.pyc")).unwrap(), [i as u8]);
-            assert_eq!(fs::read_to_string(target.join("local.json")).unwrap(), format!("secret-{i}"));
-            assert!(fs::read_to_string(target.join("SKILL.md")).unwrap().contains("second"));
+            assert_eq!(
+                fs::read(target.join("scripts/__pycache__/module.pyc")).unwrap(),
+                [i as u8]
+            );
+            assert_eq!(
+                fs::read_to_string(target.join("local.json")).unwrap(),
+                format!("secret-{i}")
+            );
+            assert!(fs::read_to_string(target.join("SKILL.md"))
+                .unwrap()
+                .contains("second"));
         }
         fs::write(input.join("local.json"), "must not publish").unwrap();
-        assert!(publish().unwrap_err().to_string().contains("source conflict"));
+        assert!(publish()
+            .unwrap_err()
+            .to_string()
+            .contains("source conflict"));
         for target in &targets {
-            assert!(fs::read_to_string(target.join("SKILL.md")).unwrap().contains("second"));
+            assert!(fs::read_to_string(target.join("SKILL.md"))
+                .unwrap()
+                .contains("second"));
         }
     }
 
@@ -487,7 +557,9 @@ mod tests {
         install(&input, 'a').unwrap();
         let targets = [
             SkillService::get_ssot_dir().unwrap().join("demo"),
-            SkillService::get_app_skills_dir(&AppType::Codex).unwrap().join("demo"),
+            SkillService::get_app_skills_dir(&AppType::Codex)
+                .unwrap()
+                .join("demo"),
         ];
         let mut handles = Vec::new();
         for target in &targets {
@@ -495,14 +567,26 @@ mod tests {
                 let file = target.join(relative);
                 fs::create_dir_all(file.parent().unwrap()).unwrap();
                 fs::write(&file, "private").unwrap();
-                handles.push(fs::OpenOptions::new().read(true).share_mode(0).open(file).unwrap());
+                handles.push(
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(file)
+                        .unwrap(),
+                );
             }
         }
         source(home.path(), "second");
         SkillService::install_local_with_runtime_files(
-            &input, "demo", "owner/private", "private-skills/demo", &"b".repeat(40),
-            &AppType::Codex, &["local.json".into()],
-        ).unwrap();
+            &input,
+            "demo",
+            "owner/private",
+            "private-skills/demo",
+            &"b".repeat(40),
+            &AppType::Codex,
+            &["local.json".into()],
+        )
+        .unwrap();
         drop(handles);
     }
 
@@ -512,18 +596,33 @@ mod tests {
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
         let input = source(home.path(), "first");
         install(&input, 'a').unwrap();
-        let app = SkillService::get_app_skills_dir(&AppType::Codex).unwrap().join("demo");
+        let app = SkillService::get_app_skills_dir(&AppType::Codex)
+            .unwrap()
+            .join("demo");
         fs::create_dir_all(app.join("scripts/__pycache__")).unwrap();
         fs::write(app.join("scripts/__pycache__/m.pyc"), "cache").unwrap();
         source(home.path(), "second");
         fs::create_dir_all(input.join("scripts/__pycache__")).unwrap();
-        fs::write(input.join("scripts/__pycache__/source.pyc"), "generated source cache").unwrap();
+        fs::write(
+            input.join("scripts/__pycache__/source.pyc"),
+            "generated source cache",
+        )
+        .unwrap();
         install(&input, 'b').unwrap();
-        assert_eq!(fs::read(app.join("scripts/__pycache__/m.pyc")).unwrap(), b"cache");
-        assert!(!SkillService::get_ssot_dir().unwrap().join("demo/scripts/__pycache__/source.pyc").exists());
+        assert_eq!(
+            fs::read(app.join("scripts/__pycache__/m.pyc")).unwrap(),
+            b"cache"
+        );
+        assert!(!SkillService::get_ssot_dir()
+            .unwrap()
+            .join("demo/scripts/__pycache__/source.pyc")
+            .exists());
         fs::write(app.join("scripts/__pycache__/keep.txt"), "user content").unwrap();
         source(home.path(), "third");
-        assert!(install(&input, 'c').unwrap_err().to_string().contains("local edits"));
+        assert!(install(&input, 'c')
+            .unwrap_err()
+            .to_string()
+            .contains("local edits"));
     }
 
     #[test]
@@ -534,7 +633,9 @@ mod tests {
         install(&input, 'a').unwrap();
         let targets = [
             SkillService::get_ssot_dir().unwrap().join("demo"),
-            SkillService::get_app_skills_dir(&AppType::Codex).unwrap().join("demo"),
+            SkillService::get_app_skills_dir(&AppType::Codex)
+                .unwrap()
+                .join("demo"),
         ];
         for target in &targets {
             fs::create_dir_all(target.join("__pycache__")).unwrap();
@@ -547,15 +648,25 @@ mod tests {
         source(home.path(), "second");
         assert_eq!(
             SkillService::install_local_with_runtime_files(
-                &input, "demo", "owner/private", "private-skills/demo", &"b".repeat(40),
-                &AppType::Codex, &[],
+                &input,
+                "demo",
+                "owner/private",
+                "private-skills/demo",
+                &"b".repeat(40),
+                &AppType::Codex,
+                &[],
             )
             .unwrap()["action"],
             "updated"
         );
         for target in targets {
-            assert_eq!(fs::read(target.join("__pycache__/module.pyc")).unwrap(), b"legacy cache");
-            assert!(fs::read_to_string(target.join("SKILL.md")).unwrap().contains("second"));
+            assert_eq!(
+                fs::read(target.join("__pycache__/module.pyc")).unwrap(),
+                b"legacy cache"
+            );
+            assert!(fs::read_to_string(target.join("SKILL.md"))
+                .unwrap()
+                .contains("second"));
         }
     }
     fn source(root: &Path, text: &str) -> PathBuf {
