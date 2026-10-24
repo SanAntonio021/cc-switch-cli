@@ -1160,14 +1160,14 @@ mod tests {
         )
     }
     #[test]
-    fn local_schema20_publication_preserves_proxy_flags_on_success_and_rejection() {
+    fn local_current_schema_publication_preserves_proxy_flags_on_success_and_rejection() {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
         let input = source(home.path(), "first");
         let db = Database::init().unwrap();
         {
             let conn = db.conn.lock().unwrap();
-            assert_eq!(Database::get_user_version(&conn).unwrap(), 20);
+            assert_eq!(Database::get_user_version(&conn).unwrap(), 22);
             assert!(
                 conn.execute(
                     "UPDATE proxy_config SET enabled=0, auto_failover_enabled=1",
@@ -1293,7 +1293,7 @@ mod tests {
         let db = Database::open_existing_current_schema().unwrap();
         assert_eq!(
             Database::get_user_version(&db.conn.lock().unwrap()).unwrap(),
-            20
+            22
         );
     }
 
@@ -1636,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn local_schema20_update_preserves_pi_mcp_unknown_skill_fields_and_settings() {
+    fn local_current_schema_update_preserves_pi_mcp_unknown_skill_fields_and_settings() {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_support::TestEnvGuard::isolated(home.path());
         let input = source(home.path(), "first");
@@ -1644,8 +1644,8 @@ mod tests {
         {
             let db = Database::init().unwrap();
             let conn = db.conn.lock().unwrap();
-            assert_eq!(Database::get_user_version(&conn).unwrap(), 20);
-            conn.execute_batch("INSERT INTO mcp_servers(id,name,server_config,enabled_codex,enabled_mcode,enabled_pi) VALUES('pi-sentinel','Pi sentinel','{}',1,1,1); ALTER TABLE skills ADD COLUMN schema20_extra TEXT; UPDATE skills SET enabled_mcode=1,schema20_extra='keep'; INSERT INTO settings(key,value) VALUES('schema20_sentinel','keep');").unwrap();
+            assert_eq!(Database::get_user_version(&conn).unwrap(), 22);
+            conn.execute_batch("INSERT INTO mcp_servers(id,name,server_config,enabled_codex,enabled_mcode,enabled_pi) VALUES('pi-sentinel','Pi sentinel','{}',1,1,1); ALTER TABLE skills ADD COLUMN desktop_extra TEXT; UPDATE skills SET enabled_mcode=1,desktop_extra='keep'; INSERT INTO settings(key,value) VALUES('desktop_sentinel','keep');").unwrap();
         }
         assert_eq!(SkillService::local_info("demo").unwrap()["found"], true);
         source(home.path(), "second");
@@ -1656,7 +1656,7 @@ mod tests {
         assert_eq!(mcp, (1, 1, 1));
         let skill: (i64, String) = conn
             .query_row(
-                "SELECT enabled_mcode,schema20_extra FROM skills WHERE directory='demo'",
+                "SELECT enabled_mcode,desktop_extra FROM skills WHERE directory='demo'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1664,7 +1664,7 @@ mod tests {
         assert_eq!(skill, (1, "keep".into()));
         assert_eq!(
             conn.query_row(
-                "SELECT value FROM settings WHERE key='schema20_sentinel'",
+                "SELECT value FROM settings WHERE key='desktop_sentinel'",
                 [],
                 |r| r.get::<_, String>(0)
             )
