@@ -32,6 +32,20 @@ fn failure(message: impl Into<String>) -> AppError {
     AppError::Message(message.into())
 }
 
+fn first_nonempty_github_token(values: [Option<String>; 2]) -> Option<String> {
+    values.into_iter().flatten().find_map(|value| {
+        let token = value.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    })
+}
+
+fn github_token_from_env() -> Option<String> {
+    first_nonempty_github_token([
+        std::env::var("GITHUB_TOKEN").ok(),
+        std::env::var("GH_TOKEN").ok(),
+    ])
+}
+
 // As with local publication, rollback leftovers may contain directories only.
 // Inspect metadata without following links, including Windows reparse points.
 fn require_pinned_empty_tree(path: &Path) -> Result<(), AppError> {
@@ -134,10 +148,14 @@ impl SkillService {
     // Bound both declared and streamed response sizes. A failed download remains
     // in a TempDir, before the existing SSOT/database/app transaction is entered.
     async fn targeted_bytes(url: url::Url, limit: u64) -> Result<Vec<u8>, AppError> {
-        let mut response = crate::proxy::http_client::get()
+        let mut request = crate::proxy::http_client::get()
             .get(url)
             .header(reqwest::header::USER_AGENT, "cc-switch")
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(std::time::Duration::from_secs(600));
+        if let Some(token) = github_token_from_env() {
+            request = request.bearer_auth(token);
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|e| failure(format!("GitHub targeted download failed: {e}")))?;
@@ -639,6 +657,19 @@ mod targeted_download_tests {
             assert!(SkillService::validate_source_commit(s).is_err());
         }
         assert!(SkillService::validate_source_commit(&"a".repeat(40)).is_ok());
+    }
+
+    #[test]
+    fn github_token_prefers_primary_and_ignores_blank_values() {
+        assert_eq!(
+            first_nonempty_github_token([Some(" primary ".into()), Some("secondary".into())]),
+            Some("primary".into())
+        );
+        assert_eq!(
+            first_nonempty_github_token([Some("  ".into()), Some(" secondary \n".into())]),
+            Some("secondary".into())
+        );
+        assert_eq!(first_nonempty_github_token([Some("\t".into()), None]), None);
     }
 }
 
